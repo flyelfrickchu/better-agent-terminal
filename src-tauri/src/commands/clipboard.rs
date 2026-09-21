@@ -4,6 +4,9 @@
 //   clipboard.writeText(text)  -> Promise<boolean>
 //   clipboard.saveImage()      -> Promise<string|null>
 //   clipboard.writeImage(file) -> Promise<boolean>
+//
+// Tauri-only addition:
+//   clipboard.readText({primary}) -> Promise<string>
 
 use crate::commands::app::log_tauri;
 use serde::Serialize;
@@ -25,6 +28,56 @@ pub fn clipboard_write_text(app: tauri::AppHandle, text: String) -> Result<bool,
         .map_err(|e| CommandError {
             message: e.to_string(),
         })
+}
+
+#[cfg(target_os = "linux")]
+fn read_primary_selection() -> Result<String, String> {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| {
+            clipboard
+                .get()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text()
+        })
+        .map_err(|e| e.to_string())
+}
+
+// WebKitGTK rejects navigator.clipboard.readText() and cannot see the PRIMARY
+// selection, so terminal paste (Ctrl+Shift+V, middle click) reads through here.
+// Must stay off the main thread: when the selection owner is this app's own
+// webview, the read waits on the GTK main loop and would deadlock.
+#[tauri::command]
+pub async fn clipboard_read_text(
+    app: tauri::AppHandle,
+    primary: Option<bool>,
+) -> Result<String, CommandError> {
+    let primary = primary.unwrap_or(false);
+    let app_clone = app.clone();
+    let result: Result<String, String> = crate::async_rt::spawn_blocking(move || {
+        #[cfg(target_os = "linux")]
+        if primary {
+            return read_primary_selection();
+        }
+        // No PRIMARY selection outside Linux; fall back to the clipboard.
+        app_clone.clipboard().read_text().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| CommandError {
+        message: e.to_string(),
+    })?;
+    match result {
+        Ok(text) => Ok(text),
+        Err(err) => {
+            // An empty or non-text clipboard is reported as an error; that is a
+            // normal "nothing to paste" outcome for the renderer.
+            log_tauri(
+                &crate::host_context::HostContext::from_app(app),
+                &format!("[clipboard] read_text primary={primary} error: {err}"),
+            );
+            Ok(String::new())
+        }
+    }
 }
 
 fn clipboard_temp_png_path() -> std::path::PathBuf {

@@ -345,13 +345,28 @@ export const TerminalPanel = memo(function TerminalPanel({
       }
     }
 
+    const text = await readClipboardText()
+    dlog(`[paste-clipboard] text length=${text.length} terminal=${terminalId}`)
+    if (text) {
+      await handlePasteText(text)
+    }
+  }
+
+  // WebKitGTK rejects navigator.clipboard.readText() with NotAllowedError and
+  // cannot see the PRIMARY selection, so read through the host first and only
+  // fall back to the web API when the host call is unavailable.
+  const readClipboardText = async ({ primary = false }: { primary?: boolean } = {}): Promise<string> => {
     try {
-      const text = await navigator.clipboard.readText()
-      if (text) {
-        await handlePasteText(text)
-      }
+      return (await host.clipboard.readText({ primary })) ?? ''
     } catch (err) {
-      console.error('Failed to read clipboard:', err)
+      dlog(`[paste-clipboard] host readText threw primary=${primary}: ${(err as Error)?.message ?? String(err)}`)
+    }
+    if (primary) return ''
+    try {
+      return await navigator.clipboard.readText()
+    } catch (err) {
+      dlog(`[paste-clipboard] navigator.clipboard.readText threw: ${(err as Error)?.message ?? String(err)}`)
+      return ''
     }
   }
 
@@ -816,8 +831,30 @@ export const TerminalPanel = memo(function TerminalPanel({
 
     // Right-click context menu for copy/paste
     const containerEl = containerRef.current
+    // Middle-click pastes the PRIMARY selection on Linux. xterm only nudges its
+    // textarea under the cursor and relies on the browser to paste, which
+    // WebKitGTK does not do here, so read the selection through the host.
+    let lastMiddleClickPasteAt = 0
+    const onMiddleClickPaste = (e: MouseEvent) => {
+      if (e.button !== 1 || host.platform !== 'linux') return
+      if (!isActiveRef.current || !ptyReadyRef.current) return
+      // Leave the click to apps that asked for mouse reports (vim, tmux…);
+      // Shift bypasses mouse reporting as in other terminals.
+      if (terminal.modes.mouseTrackingMode !== 'none' && !e.shiftKey) return
+      e.preventDefault()
+      lastMiddleClickPasteAt = Date.now()
+      readClipboardText({ primary: true }).then(text => {
+        dlog(`[paste-primary] text length=${text.length} terminal=${terminalId}`)
+        if (text) handlePasteText(text)
+      })
+    }
     const onPaste = (e: ClipboardEvent) => {
       if (!isActiveRef.current) return
+      // Swallow a native PRIMARY paste that the middle-click handler already covers.
+      if (Date.now() - lastMiddleClickPasteAt < 500) {
+        e.preventDefault()
+        return
+      }
       const text = e.clipboardData?.getData('text/plain')
       if (!text) return
       e.preventDefault()
@@ -833,6 +870,7 @@ export const TerminalPanel = memo(function TerminalPanel({
       })
     }
     containerEl.addEventListener('paste', onPaste)
+    containerEl.addEventListener('auxclick', onMiddleClickPaste)
     containerEl.addEventListener('contextmenu', onContextMenu)
 
     // Cancels in-flight scrollback hydration when the terminal unmounts.
@@ -1007,6 +1045,7 @@ export const TerminalPanel = memo(function TerminalPanel({
         ptyInputRef.current = null
       }
       containerEl.removeEventListener('paste', onPaste)
+      containerEl.removeEventListener('auxclick', onMiddleClickPaste)
       containerEl.removeEventListener('contextmenu', onContextMenu)
       doResizeRef.current = null
       terminal.dispose()

@@ -86,6 +86,12 @@ rustls-pki-types = "1.14.1"
 tauri-winrt-notification = "0.7"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already in the tree through tauri-plugin-clipboard-manager. Named directly so
+# clipboard_read_text can reach the PRIMARY selection (middle-click paste),
+# which the plugin does not expose.
+arboard = { version = "3", optional = true, features = ["wayland-data-control"] }
+
 [dev-dependencies]
 # portable-pty exposes anyhow::Result in its public mockable traits. Keep this
 # test-only direct dependency so PTY lifecycle regression fakes can implement
@@ -110,6 +116,7 @@ desktop = [
     "dep:tauri-plugin-opener",
     "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-clipboard-manager",
+    "dep:arboard",
     "dep:tauri-plugin-updater",
     "dep:tauri-plugin-notification",
 ]

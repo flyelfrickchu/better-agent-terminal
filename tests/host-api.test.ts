@@ -67,6 +67,9 @@ async function run() {
       if (cmd === 'clipboard_save_image') return '/tmp/bat-clipboard-1.png' as unknown as T
       if (cmd === 'clipboard_write_image') return true as unknown as T
       if (cmd === 'clipboard_write_text') return true as unknown as T
+      if (cmd === 'clipboard_read_text') {
+        return ((args as { primary?: boolean } | undefined)?.primary ? 'primary text' : 'clipboard text') as unknown as T
+      }
       if (cmd === 'fs_home') return '/home/me' as unknown as T
       if (cmd === 'fs_readdir') return [{ name: 'src', path: '/x/src', isDirectory: true }] as unknown as T
       if (cmd === 'fs_list_dirs') return { current: '/x', parent: null, entries: [] } as unknown as T
@@ -327,6 +330,8 @@ async function run() {
     assert.equal(wrote, true)
     assert.equal(await mod.host.clipboard.saveImage(), '/tmp/bat-clipboard-1.png')
     assert.equal(await mod.host.clipboard.writeImage('/tmp/bat-clipboard-1.png'), true)
+    assert.equal(await mod.host.clipboard.readText(), 'clipboard text')
+    assert.equal(await mod.host.clipboard.readText({ primary: true }), 'primary text')
 
     const home = await mod.host.fs.home()
     assert.equal(home, '/home/me')
@@ -762,6 +767,8 @@ async function run() {
       { cmd: 'clipboard_write_text', args: { text: 'hello clipboard' } },
       { cmd: 'clipboard_save_image', args: undefined },
       { cmd: 'clipboard_write_image', args: { filePath: '/tmp/bat-clipboard-1.png' } },
+      { cmd: 'clipboard_read_text', args: { primary: false } },
+      { cmd: 'clipboard_read_text', args: { primary: true } },
       { cmd: 'fs_home', args: undefined },
       { cmd: 'fs_readdir', args: { dirPath: '/x' } },
       { cmd: 'fs_list_dirs', args: { dirPath: '/x', includeHidden: true } },

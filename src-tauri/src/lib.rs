@@ -275,6 +275,7 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
             fs_cmd::fs_download_file,
             clipboard_cmd::clipboard_save_image,
             clipboard_cmd::clipboard_write_text,
+            clipboard_cmd::clipboard_read_text,
             clipboard_cmd::clipboard_write_image,
             image_cmd::image_read_as_data_url,
             image_cmd::image_save_data_url,

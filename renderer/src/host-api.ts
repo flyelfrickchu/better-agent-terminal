@@ -560,6 +560,11 @@ function createTauriHost(): BatAppAPI {
       writeText: (text: string) => getInvoke()<boolean>('clipboard_write_text', { text }),
       saveImage: () => getInvoke()<string | null>('clipboard_save_image'),
       writeImage: (filePath: string) => getInvoke()<boolean>('clipboard_write_image', { filePath }),
+      // WebKitGTK rejects navigator.clipboard.readText() with NotAllowedError
+      // and has no access to the X11/Wayland PRIMARY selection at all, so
+      // terminal paste reads the OS clipboard through the host instead.
+      readText: (options?: { primary?: boolean }) =>
+        getInvoke()<string>('clipboard_read_text', { primary: options?.primary === true }),
       // The host emits app:copy-shortcut from a global copy shortcut. Tauri has
       // no equivalent hook here, so emulate the same renderer callback from
       // a capture-phase keydown listener.
