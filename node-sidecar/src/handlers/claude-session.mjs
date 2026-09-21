@@ -101,7 +101,9 @@ registerHandler('claude.startSession', async (params) => {
   if (typeof optionsCwd !== 'string' || !optionsCwd) {
     throw new Error('claude.startSession: missing cwd')
   }
-  const pythonVenvEnv = loadAgentPythonEnvironment(params?.options?.worktreePath || optionsCwd)
+  const pythonCwd = params?.options?.useWorktree === true && params?.options?.worktreePath
+    ? params.options.worktreePath : optionsCwd
+  const pythonVenvEnv = loadAgentPythonEnvironment(pythonCwd)
   const s = ensureSession(sessionId)
   s.pythonVenvEnv = pythonVenvEnv
   s.agentPreset = params?.options?.agentPreset ?? null
@@ -176,7 +178,9 @@ async function resumeClaudeSession(params, opts = {}) {
     logInfo(`claude.resumeSession(${sessionId}): already attached to live sdkSessionId=${sdkSessionIdToResume}; skipping rebuild`)
     return { ok: true, sessionId, sdkSessionId: sdkSessionIdToResume, alreadyLive: true }
   }
-  const pythonVenvEnv = loadAgentPythonEnvironment(params?.options?.worktreePath || params?.options?.cwd || process.cwd())
+  const pythonCwd = params?.options?.useWorktree === true && params?.options?.worktreePath
+    ? params.options.worktreePath : params?.options?.cwd || process.cwd()
+  const pythonVenvEnv = loadAgentPythonEnvironment(pythonCwd)
   if (existing?.abortController) {
     try { existing.abortController.abort() } catch { /* already aborted */ }
   }

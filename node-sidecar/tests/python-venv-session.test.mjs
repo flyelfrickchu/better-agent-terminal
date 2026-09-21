@@ -35,7 +35,9 @@ try {
   assert.equal(sessions.has('invalid'), false, 'invalid environment must block session creation')
 
   settings(true, '.venv')
-  const started = await send('claude.startSession', { sessionId: 'enabled', options: { cwd, autoCompactWindow: 50000 } })
+  const started = await send('claude.startSession', { sessionId: 'enabled', options: {
+    cwd, autoCompactWindow: 50000, useWorktree: false, worktreePath: join(root, 'old-worktree'),
+  } })
   assert.equal(started.result?.ok, true, JSON.stringify(started))
   assert.equal(sessions.get('enabled').pythonVenvEnv.VIRTUAL_ENV, venv)
 
