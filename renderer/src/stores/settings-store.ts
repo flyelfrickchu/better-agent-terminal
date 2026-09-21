@@ -34,6 +34,8 @@ const defaultSettings: AppSettings = {
   customForegroundColor: '#dfdbc3',
   customCursorColor: '#dfdbc3',
   globalEnvVars: [],
+  agentPythonVenvEnabled: false,
+  agentPythonVenvPath: '.venv',
   defaultAgent: 'claude-code' as AgentPresetId,
   agentAutoCommand: true,
   agentCommandType: 'claude',
@@ -144,6 +146,18 @@ class SettingsStore {
   }
 
   // Environment Variables
+  setAgentPythonVenvEnabled(enabled: boolean): void {
+    this.settings = { ...this.settings, agentPythonVenvEnabled: enabled }
+    this.notify()
+    this.save()
+  }
+
+  setAgentPythonVenvPath(path: string): void {
+    this.settings = { ...this.settings, agentPythonVenvPath: path }
+    this.notify()
+    this.save()
+  }
+
   setGlobalEnvVars(envVars: EnvVariable[]): void {
     this.settings = { ...this.settings, globalEnvVars: envVars }
     this.notify()

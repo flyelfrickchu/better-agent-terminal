@@ -993,8 +993,9 @@ async function buildQueryOptions(s, sessionId, prompt) {
   if (installedPlugins.length > 0) queryOptions.plugins = installedPlugins
   queryOptions.canUseTool = (toolName, input, opts) => buildCanUseTool(s, sessionId, toolName, input, opts)
   if (s.autoCompactWindow) {
-    queryOptions.env = { ...process.env, CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(s.autoCompactWindow) }
+    queryOptions.env = { ...(s.pythonVenvEnv || process.env), CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(s.autoCompactWindow) }
   }
+  if (s.pythonVenvEnv && !queryOptions.env) queryOptions.env = { ...s.pythonVenvEnv }
   if (s.sdkSessionId) {
     queryOptions.resume = s.sdkSessionId
     if (typeof prompt === 'string' && (!prompt || prompt.trim() === '' || prompt.trim() === ' ')) {

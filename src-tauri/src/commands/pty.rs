@@ -853,6 +853,63 @@ fn build_command(opts: &CreatePtyOptions, app_data_dir: Option<&Path>) -> Comman
     cmd
 }
 
+fn configure_agent_python_venv(
+    cmd: &mut CommandBuilder,
+    options: &CreatePtyOptions,
+    data_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<Option<&'static str>, CommandError> {
+    if options.r#type == "code-agent" || options.agent_preset.is_some() {
+        if let Some(data_dir) = data_dir {
+            let venv = crate::python_venv::load(data_dir, Path::new(&options.cwd), home)
+                .map_err(|message| CommandError { message })?;
+            if let Some(venv) = venv {
+                let env = venv
+                    .environment(cmd.get_env("PATH").unwrap_or_default())
+                    .map_err(|message| CommandError { message })?;
+                cmd.env_remove("PYTHONHOME");
+                for (key, value) in env {
+                    cmd.env(key, value);
+                }
+                if options
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| command.trim().is_empty())
+                {
+                    #[cfg(unix)]
+                    let shell = cmd.get_shell();
+                    #[cfg(not(unix))]
+                    let shell = select_shell(options.shell.as_deref(), TARGET_OS, &|path| {
+                        Path::new(path).exists()
+                    });
+                    let activation = python_venv_shell_activation(&shell).ok_or_else(|| CommandError {
+                        message: format!("Python virtual environment activation is not supported for shell {shell}. Select Bash, Zsh, Fish, PowerShell, or cmd in Settings."),
+                    })?;
+                    let root = cmd.get_env("VIRTUAL_ENV").unwrap().to_owned();
+                    let bin = std::env::split_paths(cmd.get_env("PATH").unwrap())
+                        .next()
+                        .unwrap();
+                    cmd.env("_BAT_AGENT_VENV", root);
+                    cmd.env("_BAT_AGENT_VENV_BIN", bin);
+                    return Ok(Some(activation));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn python_venv_shell_activation(shell: &str) -> Option<&'static str> {
+    let name = Path::new(shell).file_stem()?.to_str()?.to_ascii_lowercase();
+    match name.as_str() {
+        "bash" | "zsh" | "sh" | "dash" | "ksh" => Some(" export VIRTUAL_ENV=\"$_BAT_AGENT_VENV\"; export PATH=\"$_BAT_AGENT_VENV_BIN:$PATH\"; unset PYTHONHOME _BAT_AGENT_VENV _BAT_AGENT_VENV_BIN; hash -r 2>/dev/null\r"),
+        "fish" => Some(" set -gx VIRTUAL_ENV \"$_BAT_AGENT_VENV\"; set -gx PATH \"$_BAT_AGENT_VENV_BIN\" $PATH; set -e PYTHONHOME; set -e _BAT_AGENT_VENV; set -e _BAT_AGENT_VENV_BIN\r"),
+        "pwsh" | "powershell" => Some(" $env:VIRTUAL_ENV=$env:_BAT_AGENT_VENV; $env:PATH=$env:_BAT_AGENT_VENV_BIN+[IO.Path]::PathSeparator+$env:PATH; Remove-Item Env:PYTHONHOME,Env:_BAT_AGENT_VENV,Env:_BAT_AGENT_VENV_BIN -ErrorAction SilentlyContinue\r"),
+        "cmd" => Some("set \"VIRTUAL_ENV=%_BAT_AGENT_VENV%\" & set \"PATH=%_BAT_AGENT_VENV_BIN%;%PATH%\" & set \"PYTHONHOME=\" & set \"_BAT_AGENT_VENV=\" & set \"_BAT_AGENT_VENV_BIN=\"\r"),
+        _ => None,
+    }
+}
+
 fn persist_worker_output(
     worker_buffer: &Arc<Mutex<HashMap<String, String>>>,
     id: &str,
@@ -1325,7 +1382,13 @@ pub(crate) fn start_pty_session(
     #[cfg(target_family = "unix")]
     configure_initial_pty_termios(app, &options.id, pair.master.as_ref());
     let app_data_dir = app.data_dir_opt();
-    let cmd = build_command(&options, app_data_dir.as_deref());
+    let mut cmd = build_command(&options, app_data_dir.as_deref());
+    let python_activation = configure_agent_python_venv(
+        &mut cmd,
+        &options,
+        app_data_dir.as_deref(),
+        app.home_dir().as_deref(),
+    )?;
     pty_input_debug_log(
         app,
         format!(
@@ -1345,6 +1408,11 @@ pub(crate) fn start_pty_session(
         message: e.to_string(),
     })?;
     let (write_tx, writer_done) = spawn_pty_input_writer(app.clone(), options.id.clone(), writer);
+    // Queue activation before publishing this PTY. The shell consumes it after
+    // its login/profile files, before any renderer auto-started agent command.
+    if let Some(activation) = python_activation {
+        let _ = write_tx.send(activation.to_string());
+    }
     let mut reader = pair.master.try_clone_reader().map_err(|e| CommandError {
         message: e.to_string(),
     })?;
@@ -2594,6 +2662,94 @@ mod tests {
             cmd.get_env("COLORTERM").and_then(|value| value.to_str()),
             Some("false")
         );
+    }
+
+    #[test]
+    fn python_venv_applies_only_to_agent_ptys_and_validates_before_spawn() {
+        let root = std::env::temp_dir().join(format!("bat-pty-venv-{}", rand::random::<u64>()));
+        let venv = root.join(".venv");
+        let bin = venv.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"agentPythonVenvEnabled":true,"agentPythonVenvPath":".venv"}"#,
+        )
+        .unwrap();
+        let mut options: CreatePtyOptions = serde_json::from_value(serde_json::json!({
+            "id": "venv-test", "cwd": root.to_str().unwrap(), "type": "terminal",
+            "customEnv": {"PATH": "/custom/bin", "PYTHONHOME": "/wrong/python"}
+        }))
+        .unwrap();
+        let mut cmd = build_command(&options, None);
+        configure_agent_python_venv(&mut cmd, &options, Some(&root), None).unwrap();
+        assert_eq!(cmd.get_env("PYTHONHOME").unwrap(), "/wrong/python");
+        options.agent_preset = Some("claude-code".into());
+        assert!(configure_agent_python_venv(&mut cmd, &options, Some(&root), None).is_err());
+        std::fs::write(venv.join("pyvenv.cfg"), "home = /python\n").unwrap();
+        let python = bin.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        std::fs::write(&python, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        configure_agent_python_venv(&mut cmd, &options, Some(&root), None).unwrap();
+        assert!(cmd.get_env("PYTHONHOME").is_none());
+        assert_eq!(
+            Path::new(cmd.get_env("VIRTUAL_ENV").unwrap()),
+            venv.canonicalize().unwrap()
+        );
+        let path = cmd.get_env("PATH").unwrap();
+        let entries = std::env::split_paths(path).collect::<Vec<_>>();
+        assert_eq!(entries[0], bin.canonicalize().unwrap());
+        assert_eq!(entries[1], PathBuf::from("/custom/bin"));
+        options.agent_preset = None;
+        options.r#type = "code-agent".into();
+        let mut shell = build_command(&options, None);
+        configure_agent_python_venv(&mut shell, &options, Some(&root), None).unwrap();
+        assert!(shell.get_env("VIRTUAL_ENV").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_venv_activation_runs_after_shell_profile_path_reset() {
+        use std::process::{Command, Stdio};
+        let root = std::env::temp_dir().join(format!("bat-venv-shell-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let rc = root.join("bashrc");
+        std::fs::write(
+            &rc,
+            "export PATH=/profile/bin\nexport PYTHONHOME=/profile/python\n",
+        )
+        .unwrap();
+        let mut child = Command::new("/bin/bash")
+            .args(["--noprofile", "--rcfile", rc.to_str().unwrap(), "-i"])
+            .env("_BAT_AGENT_VENV", "/workspace with spaces/.venv")
+            .env("_BAT_AGENT_VENV_BIN", "/workspace with spaces/.venv/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let activation = python_venv_shell_activation("/bin/bash")
+            .unwrap()
+            .replace('\r', "\n");
+        let script = format!("{activation}printf 'BAT_RESULT:%s|%s|%s\\n' \"$VIRTUAL_ENV\" \"$PATH\" \"${{PYTHONHOME-unset}}\"\nexit\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "BAT_RESULT:/workspace with spaces/.venv|/workspace with spaces/.venv/bin:/profile/bin|unset");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

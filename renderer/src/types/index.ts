@@ -262,6 +262,8 @@ export interface AppSettings {
   customForegroundColor: string;
   customCursorColor: string;
   globalEnvVars?: EnvVariable[];  // 全域環境變數
+  agentPythonVenvEnabled?: boolean;
+  agentPythonVenvPath?: string;
   defaultAgent?: AgentPresetId;   // 全域預設 Agent
   agentAutoCommand: boolean;      // 是否自動啟動 Agent
   agentCommandType: AgentCommandType;  // Agent 命令類型

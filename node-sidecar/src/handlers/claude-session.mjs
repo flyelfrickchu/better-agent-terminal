@@ -5,6 +5,7 @@
 // getContextUsage.
 
 import { existsSync } from 'node:fs'
+import { loadAgentPythonEnvironment } from '../lib/python-venv.mjs'
 
 import { registerHandler, sendEvent } from '../lib/protocol.mjs'
 import {
@@ -100,7 +101,9 @@ registerHandler('claude.startSession', async (params) => {
   if (typeof optionsCwd !== 'string' || !optionsCwd) {
     throw new Error('claude.startSession: missing cwd')
   }
+  const pythonVenvEnv = loadAgentPythonEnvironment(params?.options?.worktreePath || optionsCwd)
   const s = ensureSession(sessionId)
+  s.pythonVenvEnv = pythonVenvEnv
   s.agentPreset = params?.options?.agentPreset ?? null
   s.active = true
   s.options = params?.options ?? null
@@ -173,6 +176,7 @@ async function resumeClaudeSession(params, opts = {}) {
     logInfo(`claude.resumeSession(${sessionId}): already attached to live sdkSessionId=${sdkSessionIdToResume}; skipping rebuild`)
     return { ok: true, sessionId, sdkSessionId: sdkSessionIdToResume, alreadyLive: true }
   }
+  const pythonVenvEnv = loadAgentPythonEnvironment(params?.options?.worktreePath || params?.options?.cwd || process.cwd())
   if (existing?.abortController) {
     try { existing.abortController.abort() } catch { /* already aborted */ }
   }
@@ -184,6 +188,7 @@ async function resumeClaudeSession(params, opts = {}) {
   sessions.delete(sessionId)
   const s = ensureSession(sessionId)
   s.active = true
+  s.pythonVenvEnv = pythonVenvEnv
   s.options = params?.options ?? null
   s.agentPreset = params?.options?.agentPreset ?? null
   // Prefer the mode this session was last in. ensureSession already rehydrates

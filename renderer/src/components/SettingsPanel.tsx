@@ -930,6 +930,32 @@ export function SettingsPanel({ onClose, isRemoteProfile = false, remoteOrigin =
               </div>
 
               <div className="settings-section">
+                <h3>{t('settings.pythonVenv')}</h3>
+                <div className="settings-group checkbox-group">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={settings.agentPythonVenvEnabled === true}
+                      onChange={e => settingsStore.setAgentPythonVenvEnabled(e.target.checked)}
+                    />
+                    {t('settings.pythonVenvEnabled')}
+                  </label>
+                </div>
+                <div className="settings-group">
+                  <label htmlFor="agent-python-venv-path">{t('settings.pythonVenvPath')}</label>
+                  <input
+                    id="agent-python-venv-path"
+                    type="text"
+                    value={settings.agentPythonVenvPath ?? '.venv'}
+                    disabled={!settings.agentPythonVenvEnabled}
+                    onChange={e => settingsStore.setAgentPythonVenvPath(e.target.value)}
+                    placeholder=".venv"
+                  />
+                  <p className="settings-hint">{t('settings.pythonVenvHint')}</p>
+                </div>
+              </div>
+
+              <div className="settings-section">
                 <h3>{t('settings.modelAndEffort')}</h3>
                 <div className="settings-group">
                   <label>{t('settings.defaultClaudeModel')}</label>

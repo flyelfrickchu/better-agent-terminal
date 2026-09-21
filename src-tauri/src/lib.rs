@@ -28,6 +28,7 @@ mod log_file;
 mod network_addresses;
 mod panic_log;
 mod path_guard;
+mod python_venv;
 mod remote_client;
 mod profile_context;
 pub mod remote_core;

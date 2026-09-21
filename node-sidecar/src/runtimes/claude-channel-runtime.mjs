@@ -7,6 +7,7 @@ import { sendEvent } from '../lib/protocol.mjs'
 import { log, warn } from '../lib/logger.mjs'
 import { normalizeClaudeEffortMode, runtimeEffortForMode, isUltracodeMode } from '../lib/claude-effort.mjs'
 import { resolveDataDir } from '../lib/data-paths.mjs'
+import { loadAgentPythonEnvironment } from '../lib/python-venv.mjs'
 import { isBatDebugEnabled, probeClaudeChannelCapabilities } from './claude-channel-capabilities.mjs'
 import { writeClaudeChannelServerScript } from './claude-channel-server.mjs'
 import { FRAME_KINDS, normalizeFrame, subEventNameFor } from './claude-channel-frames.mjs'
@@ -585,7 +586,7 @@ async function loadNodePty() {
 }
 
 async function spawnClaudeProcess(session, cliPath, args, bridgeUrl) {
-  const env = { ...process.env, BAT_CHANNEL_BRIDGE_URL: bridgeUrl, TERM: process.env.TERM || 'xterm-256color' }
+  const env = { ...(session.pythonVenvEnv || process.env), BAT_CHANNEL_BRIDGE_URL: bridgeUrl, TERM: process.env.TERM || 'xterm-256color' }
   const pty = await loadNodePty()
   if (pty?.spawn) {
     try {
@@ -782,6 +783,7 @@ export async function startClaudeChannelSession(params = {}) {
   const session = {
     sessionId,
     cwd: String(params.cwd || process.cwd()),
+    pythonVenvEnv: loadAgentPythonEnvironment(String(params.cwd || process.cwd())),
     workspaceId: params.workspaceId || null,
     cliPath,
     model: params.model || null,

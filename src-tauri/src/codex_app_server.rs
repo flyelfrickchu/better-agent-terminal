@@ -330,6 +330,7 @@ pub struct CodexAppServerState {
 #[derive(Clone)]
 struct CodexSession {
     session_id: String,
+    python_venv_env: Option<HashMap<String, String>>,
     thread_id: Option<String>,
     // A newly created thread only lives in the current app-server process until
     // its first turn starts. If the idle reaper restarts that process first,
@@ -1882,6 +1883,45 @@ fn build_thread_start_params(
     }
     apply_codex_context_window_override(&mut params, model);
     params
+}
+
+// The app-server is shared by sessions. Apply Python activation per thread so
+// two workspaces can use different environments without restarting each other.
+fn with_python_venv(mut params: Value, env: Option<&HashMap<String, String>>) -> Value {
+    if let Some(env) = env {
+        if !params["config"].is_object() {
+            params["config"] = json!({});
+        }
+        for (key, value) in env {
+            params["config"][format!("shell_environment_policy.set.{key}")] = json!(value);
+        }
+        // Python treats an empty PYTHONHOME as unset. Unlike an exclusion list,
+        // this doesn't replace the user's other environment filtering rules.
+        params["config"]["shell_environment_policy.set.PYTHONHOME"] = json!("");
+    }
+    params
+}
+
+fn load_python_venv_environment(
+    app: &HostContext,
+    cwd: &str,
+) -> Result<Option<HashMap<String, String>>, BridgeError> {
+    let Some(data_dir) = app.data_dir_opt() else {
+        return Ok(None);
+    };
+    let Some(venv) = crate::python_venv::load(&data_dir, Path::new(cwd), app.home_dir().as_deref())
+        .map_err(bridge_error)?
+    else {
+        return Ok(None);
+    };
+    let extra_dirs = match resolve_codex_binary(app) {
+        CodexBinary::Native(path) => codex_path_dir_for_binary(&path)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        CodexBinary::Wrapper(_) => Vec::new(),
+    };
+    let path = augmented_path_with_runtime_dirs(&extra_dirs).unwrap_or_default();
+    venv.environment(&path).map(Some).map_err(bridge_error)
 }
 
 fn build_thread_resume_params(
@@ -3986,6 +4026,14 @@ impl CodexAppServerState {
         }))
     }
 
+    fn session_python_venv_params(&self, session_id: &str, params: Value) -> Value {
+        let sessions = self.inner.sessions.lock().expect("codex sessions lock");
+        let env = sessions
+            .get(session_id)
+            .and_then(|session| session.python_venv_env.as_ref());
+        with_python_venv(params, env)
+    }
+
     fn ensure_thread_for_session(
         &self,
         app: &HostContext,
@@ -4021,7 +4069,10 @@ impl CodexAppServerState {
                 app,
                 session_id,
                 "thread/start",
-                build_thread_start_params(&model, &cwd, &approval_policy, &sandbox_mode),
+                self.session_python_venv_params(
+                    &session_id,
+                    build_thread_start_params(&model, &cwd, &approval_policy, &sandbox_mode),
+                ),
                 REQUEST_TIMEOUT,
             )
             .map_err(bridge_error)?;
@@ -4085,7 +4136,10 @@ impl CodexAppServerState {
             app,
             session_id,
             "thread/start",
-            build_thread_start_params(model, cwd, approval_policy, sandbox_mode),
+            self.session_python_venv_params(
+                &session_id,
+                build_thread_start_params(model, cwd, approval_policy, sandbox_mode),
+            ),
             REQUEST_TIMEOUT,
         )?;
         let new_thread_id = response
@@ -4764,6 +4818,7 @@ impl CodexAppServerState {
     ) -> Result<Value, BridgeError> {
         let options = options.unwrap_or(Value::Null);
         let cwd = effective_cwd(&options, "startSession")?;
+        let python_venv_env = load_python_venv_environment(app, &cwd)?;
         let model = options
             .get("model")
             .and_then(Value::as_str)
@@ -4783,6 +4838,7 @@ impl CodexAppServerState {
             ),
         );
         let session = CodexSession {
+            python_venv_env: python_venv_env.clone(),
             session_id: session_id.clone(),
             thread_id: None,
             thread_has_started_turn: false,
@@ -4841,7 +4897,10 @@ impl CodexAppServerState {
                 app,
                 &session_id,
                 "thread/start",
-                build_thread_start_params(&model, &cwd, &approval_policy, &sandbox_mode),
+                self.session_python_venv_params(
+                    &session_id,
+                    build_thread_start_params(&model, &cwd, &approval_policy, &sandbox_mode),
+                ),
                 REQUEST_TIMEOUT,
             )
             .map_err(|err| {
@@ -4977,6 +5036,7 @@ impl CodexAppServerState {
     ) -> Result<Value, BridgeError> {
         let options = options.unwrap_or(Value::Null);
         let cwd = effective_cwd(&options, "resumeSession")?;
+        let python_venv_env = load_python_venv_environment(app, &cwd)?;
         let model = options
             .get("model")
             .and_then(Value::as_str)
@@ -5007,14 +5067,17 @@ impl CodexAppServerState {
             app,
             &session_id,
             "thread/resume",
-            json!({
-                "threadId": sdk_session_id,
-                "model": model,
-                "cwd": cwd,
-                "approvalPolicy": approval_policy,
-                "sandbox": app_server_sandbox(&sandbox_mode),
-                "serviceName": "better_agent_terminal",
-            }),
+            with_python_venv(
+                json!({
+                    "threadId": sdk_session_id,
+                    "model": model,
+                    "cwd": cwd,
+                    "approvalPolicy": approval_policy,
+                    "sandbox": app_server_sandbox(&sandbox_mode),
+                    "serviceName": "better_agent_terminal",
+                }),
+                python_venv_env.as_ref(),
+            ),
             REQUEST_TIMEOUT,
         );
         if let Err(err) = response {
@@ -5030,6 +5093,7 @@ impl CodexAppServerState {
 
         let context_window = codex_context_window_for_model(&model);
         let session = CodexSession {
+            python_venv_env: python_venv_env.clone(),
             session_id: session_id.clone(),
             thread_id: Some(sdk_session_id.clone()),
             // A successful thread/resume proves this thread has persisted
@@ -5442,12 +5506,15 @@ impl CodexAppServerState {
                         app,
                         &session_id,
                         "thread/resume",
-                        build_thread_resume_params(
-                            &thread_id,
-                            &model,
-                            &cwd,
-                            &approval_policy,
-                            &sandbox_mode,
+                        self.session_python_venv_params(
+                            &session_id,
+                            build_thread_resume_params(
+                                &thread_id,
+                                &model,
+                                &cwd,
+                                &approval_policy,
+                                &sandbox_mode,
+                            ),
                         ),
                         REQUEST_TIMEOUT,
                     ) {
@@ -5859,7 +5926,10 @@ impl CodexAppServerState {
                 app,
                 &session_id,
                 "thread/start",
-                build_thread_start_params(&model, &cwd, &approval_policy, &sandbox_mode),
+                self.session_python_venv_params(
+                    &session_id,
+                    build_thread_start_params(&model, &cwd, &approval_policy, &sandbox_mode),
+                ),
                 REQUEST_TIMEOUT,
             )
             .map_err(bridge_error)?;
@@ -6139,14 +6209,17 @@ impl CodexAppServerState {
                 app,
                 session_id,
                 "thread/resume",
-                json!({
-                    "threadId": thread_id,
-                    "model": model,
-                    "cwd": cwd,
-                    "approvalPolicy": approval_policy,
-                    "sandbox": app_server_sandbox(&sandbox_mode),
-                    "serviceName": "better_agent_terminal",
-                }),
+                self.session_python_venv_params(
+                    session_id,
+                    json!({
+                        "threadId": thread_id,
+                        "model": model,
+                        "cwd": cwd,
+                        "approvalPolicy": approval_policy,
+                        "sandbox": app_server_sandbox(&sandbox_mode),
+                        "serviceName": "better_agent_terminal",
+                    }),
+                ),
                 REQUEST_TIMEOUT,
             )
             .map_err(bridge_error)?;
@@ -7662,11 +7735,74 @@ mod tests {
         assert!(is_quiet_codex_notification("thread/status/changed"));
         assert!(is_quiet_codex_notification("mcpServer/startupStatus/updated"));
         assert!(!is_quiet_codex_notification("warning"));
-        assert!(!is_quiet_codex_notification("item/reasoning/summaryPartAdded"));
+        assert!(!is_quiet_codex_notification(
+            "item/reasoning/summaryPartAdded"
+        ));
+    }
+
+    #[test]
+    fn python_venv_is_applied_per_thread_without_replacing_other_config() {
+        let params =
+            build_thread_start_params("gpt-6-astra:872k", "/repo", "on-request", "workspace-write");
+        assert_eq!(with_python_venv(params.clone(), None), params);
+        let env = HashMap::from([
+            ("PATH".into(), "/repo/.venv/bin:/usr/bin".into()),
+            ("VIRTUAL_ENV".into(), "/repo/.venv".into()),
+        ]);
+        let activated = with_python_venv(params, Some(&env));
+        assert_eq!(activated["config"]["model_context_window"], 872_000);
+        assert_eq!(
+            activated["config"]["shell_environment_policy.set.VIRTUAL_ENV"],
+            "/repo/.venv"
+        );
+        assert_eq!(
+            activated["config"]["shell_environment_policy.set.PATH"],
+            "/repo/.venv/bin:/usr/bin"
+        );
+        assert_eq!(
+            activated["config"]["shell_environment_policy.set.PYTHONHOME"],
+            ""
+        );
+        assert_eq!(activated["approvalPolicy"], "on-request");
+        assert!(activated["config"]
+            .get("shell_environment_policy.inherit")
+            .is_none());
+    }
+
+    #[test]
+    fn python_venv_snapshot_does_not_leak_between_codex_sessions() {
+        let state = CodexAppServerState::default();
+        let mut enabled = test_codex_session();
+        enabled.python_venv_env =
+            Some(HashMap::from([("VIRTUAL_ENV".into(), "/one/.venv".into())]));
+        let mut disabled = test_codex_session();
+        disabled.session_id = "session-2".into();
+        {
+            let mut sessions = state.inner.sessions.lock().unwrap();
+            sessions.insert(enabled.session_id.clone(), enabled);
+            sessions.insert(disabled.session_id.clone(), disabled);
+        }
+        let resume = build_thread_resume_params(
+            "thread-1",
+            "gpt-6-astra",
+            "/repo",
+            "on-request",
+            "workspace-write",
+        );
+        assert_eq!(
+            state.session_python_venv_params("session-1", resume.clone())["config"]
+                ["shell_environment_policy.set.VIRTUAL_ENV"],
+            "/one/.venv"
+        );
+        assert_eq!(
+            state.session_python_venv_params("session-2", resume.clone()),
+            resume
+        );
     }
 
     fn test_codex_session() -> CodexSession {
         CodexSession {
+            python_venv_env: None,
             session_id: "session-1".to_string(),
             thread_id: Some("thread-1".to_string()),
             thread_has_started_turn: true,
@@ -8416,6 +8552,7 @@ mod tests {
     #[test]
     fn codex_metadata_includes_context_window() {
         let session = CodexSession {
+            python_venv_env: None,
             session_id: "s-1".to_string(),
             thread_id: Some("thread-1".to_string()),
             thread_has_started_turn: true,
@@ -8465,6 +8602,7 @@ mod tests {
     #[test]
     fn codex_runtime_status_clear_reports_only_when_status_was_set() {
         let mut session = CodexSession {
+            python_venv_env: None,
             session_id: "s-1".to_string(),
             thread_id: Some("thread-1".to_string()),
             thread_has_started_turn: true,
@@ -8522,6 +8660,7 @@ mod tests {
     fn codex_context_usage_uses_app_server_usage_shape() {
         let state = CodexAppServerState::default();
         let mut session = CodexSession {
+            python_venv_env: None,
             session_id: "s-1".to_string(),
             thread_id: Some("thread-1".to_string()),
             thread_has_started_turn: true,
@@ -9038,7 +9177,10 @@ invalid json
 
     /// A CodexConnection around a short-lived child. These tests never write
     /// to stdin; Drop only kills and reaps whatever is left.
-    fn test_connection(binary_identity: &str, auth_account_id: Option<&str>) -> Arc<CodexConnection> {
+    fn test_connection(
+        binary_identity: &str,
+        auth_account_id: Option<&str>,
+    ) -> Arc<CodexConnection> {
         let mut command = if cfg!(windows) {
             let mut command = Command::new("cmd");
             command.args(["/C", "exit", "0"]);
