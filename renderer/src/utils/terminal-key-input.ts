@@ -127,7 +127,7 @@ export function isPrintableTerminalInputData(data: string): boolean {
 export function getExpectedPlainBackspaceInput(
   platform?: TerminalInputPlatform,
 ): string | null {
-  if (platform === 'darwin') return '\x7f'
+  if (platform === 'darwin' || platform === 'linux') return '\x7f'
   return null
 }
 
@@ -154,7 +154,7 @@ export function getTerminalKeyInputOverride(
   if (event.type !== 'keydown') return null
   const expectedPlainBackspaceInput = getExpectedPlainBackspaceInput(options.platform)
 
-  // macOS shells commonly configure erase as ^? (DEL / 0x7f). Force that
+  // macOS and Linux shells commonly configure erase as ^? (DEL / 0x7f). Force that
   // byte for plain Backspace so the terminal deletes instead of inserting
   // a visible control/space glyph when the browser event path varies.
   if (

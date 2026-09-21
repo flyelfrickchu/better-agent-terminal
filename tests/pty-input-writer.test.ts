@@ -132,6 +132,18 @@ async function main() {
       }, { platform: 'darwin' }),
       '\x7f',
     )
+    for (const imeComposing of [false, true]) {
+      assert.equal(
+        getTerminalKeyInput({
+          type: 'keydown',
+          key: 'Backspace',
+          code: 'Backspace',
+          keyCode: 8,
+        }, { platform: 'linux', imeComposing }),
+        imeComposing ? null : '\x7f',
+        'Linux Backspace must send DEL outside IME composition',
+      )
+    }
     assert.equal(getExpectedPlainBackspaceInput('darwin'), '\x7f')
     assert.equal(getExpectedPlainBackspaceInput('win32'), null)
     assert.equal(shouldUseDirectTerminalKeyInput('darwin'), true)
