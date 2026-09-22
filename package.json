@@ -34,6 +34,7 @@
     "test:file-picker-search": "tsx tests/file-picker-search.test.ts",
     "test:file-preview-types": "tsx tests/file-preview-types.test.ts",
     "test:pty-input-writer": "tsx tests/pty-input-writer.test.ts",
+    "test:terminal-output-memory": "tsx tests/terminal-output-memory.test.ts",
     "test:workspace-move-drag": "tsx tests/workspace-move-drag.test.ts",
     "test:workspace-switch-performance": "tsx tests/workspace-switch-performance.test.ts",
     "test:workspace-sdk-session-owner": "tsx tests/workspace-sdk-session-owner.test.ts",

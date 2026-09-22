@@ -7,6 +7,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { settingsStore } from '../stores/settings-store'
 import { workspaceStore } from '../stores/workspace-store'
 import type { WorkerCommandRequest, WorkerCommandResult } from '../utils/worker-command'
+import { WorkerLogStore, type WorkerLogEntry } from '../utils/worker-log-entries'
 import '@xterm/xterm/css/xterm.css'
 
 const dlog = (...args: unknown[]) => host.debug.log(...args)
@@ -28,11 +29,6 @@ interface WorkerProcess {
   autoStart: boolean
 }
 
-interface WorkerLogEntry {
-  name: string
-  color: string
-  data: string
-}
 
 function parseWorkerBuffer(raw: string): WorkerLogEntry[] {
   if (!raw.trim()) return []
@@ -168,7 +164,8 @@ export const WorkerPanel = memo(function WorkerPanel({ terminalId, procfilePath,
   const shellRef = useRef<string | undefined>()
   const ptyIdsRef = useRef<Set<string>>(new Set())
   const logVisibleRef = useRef<Map<string, boolean>>(new Map())
-  const entriesRef = useRef<WorkerLogEntry[]>([])
+  // Bounded (1 MiB) mirror of the host scrollback; see utils/worker-log-entries.ts
+  const entriesRef = useRef(new WorkerLogStore())
   const pendingBatchRef = useRef<WorkerLogEntry[]>([])
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const spotlightRef = useRef<string | null>(null)
@@ -248,7 +245,7 @@ export const WorkerPanel = memo(function WorkerPanel({ terminalId, procfilePath,
     }
     await flushToDisk()
 
-    reRenderTerminal(entriesRef.current, map)
+    reRenderTerminal(entriesRef.current.entries, map)
   }, [flushToDisk, reRenderTerminal])
 
   const toggleSpotlight = useCallback(async (name: string) => {
@@ -267,7 +264,7 @@ export const WorkerPanel = memo(function WorkerPanel({ terminalId, procfilePath,
     if (next !== null) {
       for (const proc of processesRef.current) map.set(proc.name, proc.name === next)
     }
-    reRenderTerminal(entriesRef.current, map)
+    reRenderTerminal(entriesRef.current.entries, map)
   }, [flushToDisk, reRenderTerminal])
 
   const handleProcessListWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
@@ -287,7 +284,7 @@ export const WorkerPanel = memo(function WorkerPanel({ terminalId, procfilePath,
     }
     pendingBatchRef.current = []
     await host.workerBuffer.clear(terminalId)
-    entriesRef.current = []
+    entriesRef.current.clear()
 
     midLineRef.current = new Map()
     const headerText = buildWorkerHeader(procfilePath, processesRef.current.length)
@@ -845,7 +842,7 @@ export const WorkerPanel = memo(function WorkerPanel({ terminalId, procfilePath,
       const rawBuffer = await host.workerBuffer.readAll(terminalId).catch(() => '')
       const restoredEntries = parseWorkerBuffer(rawBuffer)
       if (restoredEntries.length > 0) {
-        entriesRef.current = restoredEntries
+        entriesRef.current.replace(restoredEntries)
         reRenderTerminal(restoredEntries, logVisibleRef.current)
       } else {
         // Write header (use __header__ as a virtual name so it's always visible during re-render)
