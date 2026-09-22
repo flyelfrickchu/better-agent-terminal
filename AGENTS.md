@@ -35,3 +35,13 @@ Follow the project guidance in `CLAUDE.md`. The most important operational notes
 - New IPC commands or events may be added for capabilities, diagnostics, metrics, or explicitly new UI features, but they must not be required to keep existing UI workflows functioning.
 - Keep runtime ownership per session explicit. A session should be owned by either Rust or the Node sidecar for its lifecycle; avoid mixing Rust and Node responses for the same running session except through deliberate fallback at session start.
 - Fallback should happen below the renderer contract. If Rust cannot handle a Codex capability yet, route or degrade inside Tauri/sidecar code without forcing renderer callsite changes.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
