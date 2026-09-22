@@ -161,10 +161,11 @@ export function ClaudeCliPanel({ terminal, isActive, onClose, workspaceId }: Rea
           args: launch.args,
           cols: readySize.cols,
           rows: readySize.rows,
-          customEnv: {
-            ...customEnv,
-            CLAUDE_CODE_NO_FLICKER: '1',
-          },
+          // Do not set CLAUDE_CODE_NO_FLICKER here: it forces the CLI's
+          // alt-screen renderer, which has no xterm scrollback so the host
+          // scrollbar stops working. The generated --settings file pins
+          // tui=default instead.
+          customEnv,
           perTerminalHistory: settings.perTerminalHistory,
           historyKey: terminal.historyKey,
         })

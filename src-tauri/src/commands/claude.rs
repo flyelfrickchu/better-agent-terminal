@@ -1123,7 +1123,23 @@ fn write_claude_cli_hook_assets(
         cwd,
     );
 
-    let settings = json!({
+    let settings = build_claude_cli_settings(&hook_command);
+    let settings_text = serde_json::to_string_pretty(&settings)?;
+    write_if_changed(&settings_path, &(settings_text + "\n"))?;
+    Ok((settings_path, events_path, hook_script_path, node_path_text))
+}
+
+/// Settings passed to the Claude CLI via `--settings` for PTY-hosted sessions.
+///
+/// `tui` is pinned to the classic main-screen renderer. The fullscreen renderer
+/// (alt screen, also forced by `CLAUDE_CODE_NO_FLICKER=1`) keeps its own
+/// virtualized scrollback, so xterm has nothing to scroll and the host
+/// scrollbar stops working. `--settings` outranks the user's own `tui`
+/// preference, so this holds even when `~/.claude/settings.json` says
+/// `fullscreen`.
+fn build_claude_cli_settings(hook_command: &str) -> serde_json::Value {
+    json!({
+        "tui": "default",
         "hooks": {
             "SessionStart": [
                 {
@@ -1137,10 +1153,7 @@ fn write_claude_cli_hook_assets(
                 }
             ]
         }
-    });
-    let settings_text = serde_json::to_string_pretty(&settings)?;
-    write_if_changed(&settings_path, &(settings_text + "\n"))?;
-    Ok((settings_path, events_path, hook_script_path, node_path_text))
+    })
 }
 
 pub(crate) fn prepare_cli_session_native(
@@ -5935,6 +5948,17 @@ mod tests {
             shell_quote("C:\\Users\\O'Malley"),
             r#"'C:\Users\O'"'"'Malley'"#
         );
+    }
+
+    #[test]
+    fn claude_cli_settings_pin_main_screen_renderer_and_session_hook() {
+        let settings = build_claude_cli_settings("node hook.mjs");
+        // The host xterm owns scrollback, so the alt-screen renderer must stay off.
+        assert_eq!(settings["tui"], "default");
+        let hook = &settings["hooks"]["SessionStart"][0];
+        assert_eq!(hook["matcher"], "startup|resume|clear|compact");
+        assert_eq!(hook["hooks"][0]["type"], "command");
+        assert_eq!(hook["hooks"][0]["command"], "node hook.mjs");
     }
 
     #[test]

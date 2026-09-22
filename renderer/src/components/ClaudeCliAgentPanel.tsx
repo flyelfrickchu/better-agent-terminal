@@ -264,10 +264,10 @@ export function ClaudeCliAgentPanel({
           args: launch.args,
           cols: readySize.cols,
           rows: readySize.rows,
-          customEnv: {
-            ...customEnv,
-            CLAUDE_CODE_NO_FLICKER: '1',
-          },
+          // No CLAUDE_CODE_NO_FLICKER: the alt-screen renderer has no xterm
+          // scrollback, which breaks the host scrollbar. The sidecar-generated
+          // settings file pins tui=default instead.
+          customEnv,
           perTerminalHistory: settings.perTerminalHistory,
           historyKey: terminal.historyKey,
         })

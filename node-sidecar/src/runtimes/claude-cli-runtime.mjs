@@ -242,6 +242,12 @@ async function writeSessionSettings(session, bridgeUrl) {
   await mkdir(root, { recursive: true, mode: 0o700 })
   const settingsPath = join(root, 'settings.json')
   const settings = buildHooksConfig(bridgeUrl)
+  // Pin the classic main-screen renderer. The fullscreen (alt-screen) renderer
+  // keeps its own virtualized scrollback, so the host xterm has nothing to
+  // scroll and its scrollbar stops working. `--settings` outranks the user's
+  // own `tui` preference, so this holds even if ~/.claude/settings.json says
+  // "fullscreen". Never set CLAUDE_CODE_NO_FLICKER=1 on the PTY: it overrides this.
+  settings.tui = 'default'
   if (isUltracodeMode(session.effort) || session.ultracode === true) {
     settings.ultracode = true
     settings.enableWorkflows = true

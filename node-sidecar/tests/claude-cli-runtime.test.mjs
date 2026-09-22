@@ -152,6 +152,9 @@ async function main() {
     const settings = JSON.parse(readFileSync(started.settingsPath, 'utf8'))
     assert.ok(Array.isArray(settings.hooks.PreToolUse))
     assert.match(settings.hooks.PreToolUse[0].hooks[0].url, /^http:\/\/127\.0\.0\.1:\d+\/hook\/PreToolUse$/)
+    // The host terminal owns scrollback; the CLI must stay on the main screen
+    // buffer even when the user's own settings prefer the fullscreen renderer.
+    assert.equal(settings.tui, 'default')
 
     const transcriptPath = join(sessionDir, `${cliSessionId}.jsonl`)
     writeFileSync(transcriptPath, '')
