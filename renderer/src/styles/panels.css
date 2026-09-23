@@ -528,6 +528,9 @@
   left: 220px !important;
   top: auto !important;
   opacity: 1 !important;
+  /* The textarea stays visible for IME anchoring; hide its native caret so
+     WebKitGTK does not draw a blinking bar over the terminal. */
+  caret-color: transparent !important;
   width: 1px !important;
   height: 20px !important;
   font-size: 14px !important;
