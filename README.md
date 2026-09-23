@@ -42,6 +42,12 @@ Mobile apps require Better Agent Terminal **v3.1.3 or later**.
 
 ---
 
+## Architecture
+
+<div align="center">
+	<img src="docs/diagrams/architectural.png" alt="Architecture" width="800">
+</div>
+
 ## Screenshots
 
 <div align="center">
