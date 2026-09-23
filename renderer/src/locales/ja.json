@@ -374,6 +374,7 @@
     "notAuthenticated": "GitHub にログインしていません。ターミナルで 'gh auth login' を実行してください。",
     "noPRs": "オープン中のプルリクエストはありません",
     "noIssues": "オープン中の Issue はありません",
+    "issuesDisabled": "このリポジトリでは Issue が無効になっています",
     "selectItem": "詳細を表示するには項目を選択してください",
     "draft": "下書き",
     "noDescription": "説明なし",

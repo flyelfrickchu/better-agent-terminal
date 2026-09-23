@@ -2,6 +2,7 @@ import { host } from '../host-api'
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18next from 'i18next'
+import { resolveGitHubListResult } from '../utils/github-list-results'
 import '../styles/github-panel.css'
 
 interface GitHubPanelProps {
@@ -96,7 +97,11 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
   const [detail, setDetail] = useState<PRDetail | IssueDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // Per-list errors: one failing list (e.g. issues disabled on a fork) must not hide the other.
+  const [prError, setPrError] = useState<string | null>(null)
+  const [issueError, setIssueError] = useState<string | null>(null)
+  const [issuesDisabled, setIssuesDisabled] = useState(false)
+  const [detailError, setDetailError] = useState<string | null>(null)
   const [sentMessage, setSentMessage] = useState<string | null>(null)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: GitHubPR | GitHubIssue } | null>(null)
   const [commentBody, setCommentBody] = useState('')
@@ -105,24 +110,28 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
 
   const loadData = useCallback(async () => {
     setLoading(true)
-    setError(null)
+    setPrError(null)
+    setIssueError(null)
+    setIssuesDisabled(false)
     try {
       const [prResult, issueResult] = await Promise.all([
         host.github.listPRs(workspaceFolderPath),
         host.github.listIssues(workspaceFolderPath),
       ])
-      if (prResult && 'error' in prResult) {
-        setError(prResult.error as string)
-      } else {
-        setPrs(prResult as GitHubPR[])
-      }
-      if (issueResult && 'error' in issueResult) {
-        if (!error) setError(issueResult.error as string)
-      } else {
-        setIssues(issueResult as GitHubIssue[])
-      }
+      const prList = resolveGitHubListResult<GitHubPR>(prResult)
+      const issueList = resolveGitHubListResult<GitHubIssue>(issueResult)
+      setPrs(prList.items)
+      setPrError(prList.error)
+      setIssues(issueList.items)
+      setIssueError(issueList.error)
+      setIssuesDisabled(issueList.disabled)
+      if (prList.error) void host.debug.log(`[GitHubPanel] pr list failed (${workspaceFolderPath}): ${prList.error}`).catch(() => {})
+      if (issueList.error) void host.debug.log(`[GitHubPanel] issue list failed (${workspaceFolderPath}): ${issueList.error}`).catch(() => {})
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      const message = e instanceof Error ? e.message : String(e)
+      setPrError(message)
+      setIssueError(message)
+      void host.debug.log(`[GitHubPanel] list fetch threw (${workspaceFolderPath}): ${message}`).catch(() => {})
     } finally {
       setLoading(false)
     }
@@ -141,8 +150,9 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
 
   // Load detail when item selected
   useEffect(() => {
-    if (!selectedItem) { setDetail(null); return }
+    if (!selectedItem) { setDetail(null); setDetailError(null); return }
     setCommentBody('')
+    setDetailError(null)
     setDetailLoading(true)
     const promise = selectedItem.type === 'pr'
       ? host.github.viewPR(workspaceFolderPath, selectedItem.number)
@@ -150,7 +160,8 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
     promise.then(result => {
       if (result && 'error' in result) {
         setDetail(null)
-        setError(result.error as string)
+        setDetailError(result.error as string)
+        void host.debug.log(`[GitHubPanel] ${selectedItem.type} #${selectedItem.number} view failed: ${result.error}`).catch(() => {})
       } else {
         setDetail(result as PRDetail | IssueDetail)
       }
@@ -264,7 +275,10 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
   }
 
   const items = subTab === 'prs' ? prs : issues
-  const emptyMessage = subTab === 'prs' ? t('github.noPRs') : t('github.noIssues')
+  const listError = subTab === 'prs' ? prError : issueError
+  const emptyMessage = subTab === 'prs'
+    ? t('github.noPRs')
+    : issuesDisabled ? t('github.issuesDisabled') : t('github.noIssues')
 
   return (
     <div className="github-panel">
@@ -307,8 +321,11 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
         <div className="github-item-list">
           {loading ? (
             <div className="github-empty">{t('github.loading')}</div>
-          ) : error ? (
-            <div className="github-empty github-error-text">{t('github.fetchError')}</div>
+          ) : listError ? (
+            <div className="github-empty github-error-text">
+              {t('github.fetchError')}
+              <div className="github-error-detail">{listError}</div>
+            </div>
           ) : items.length === 0 ? (
             <div className="github-empty">{emptyMessage}</div>
           ) : (
@@ -349,6 +366,11 @@ export function GitHubPanel({ workspaceFolderPath, onSendToClaude }: Readonly<Gi
       <div className="github-detail-col">
         {detailLoading ? (
           <div className="github-detail-placeholder">{t('github.loading')}</div>
+        ) : detailError ? (
+          <div className="github-detail-placeholder github-error-text">
+            {t('github.fetchError')}
+            <div className="github-error-detail">{detailError}</div>
+          </div>
         ) : !detail ? (
           <div className="github-detail-placeholder">{t('github.selectItem')}</div>
         ) : (

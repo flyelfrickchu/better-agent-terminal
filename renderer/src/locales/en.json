@@ -383,6 +383,7 @@
     "notAuthenticated": "Not logged in to GitHub. Run 'gh auth login' in a terminal.",
     "noPRs": "No open pull requests",
     "noIssues": "No open issues",
+    "issuesDisabled": "Issues are disabled for this repository",
     "selectItem": "Select an item to view details",
     "draft": "Draft",
     "noDescription": "no description",

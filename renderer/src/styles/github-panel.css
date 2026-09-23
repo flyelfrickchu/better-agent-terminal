@@ -361,6 +361,19 @@
 
 .github-error-text {
   color: #f44336;
+  flex-direction: column;
+  gap: 6px;
+  text-align: center;
+}
+
+/* Raw gh stderr under the generic error, so the cause is visible */
+.github-error-detail {
+  color: var(--text-secondary);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
 }
 
 /* Consent screen */

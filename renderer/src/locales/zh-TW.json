@@ -383,6 +383,7 @@
     "notAuthenticated": "尚未登入 GitHub。請在終端執行 'gh auth login'",
     "noPRs": "沒有開啟中的 Pull Request",
     "noIssues": "沒有開啟中的 Issue",
+    "issuesDisabled": "此儲存庫已停用 Issue",
     "selectItem": "選擇項目以檢視詳情",
     "draft": "草稿",
     "noDescription": "無描述",

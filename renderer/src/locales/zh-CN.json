@@ -373,6 +373,7 @@
     "notAuthenticated": "尚未登录 GitHub。请在终端运行 'gh auth login'",
     "noPRs": "没有打开的 Pull Request",
     "noIssues": "没有打开的 Issue",
+    "issuesDisabled": "此仓库已停用 Issue",
     "selectItem": "选择项目以查看详情",
     "draft": "草稿",
     "noDescription": "无描述",
