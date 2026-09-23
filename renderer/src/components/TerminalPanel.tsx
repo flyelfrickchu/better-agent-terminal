@@ -20,6 +20,7 @@ import {
   isPrintableTerminalInputData,
   shouldBlockForImeComposition,
   shouldTraceTerminalInputData,
+  scrollTerminalToBottomForUserInput,
   shouldTraceTerminalKeyEvent,
   shouldUseDirectTerminalKeyInput,
 } from '../utils/terminal-key-input'
@@ -243,6 +244,7 @@ export const TerminalPanel = memo(function TerminalPanel({
 
   const writePtyInput = (data: string) => {
     traceTerminalInputData('writePtyInput', data)
+    if (terminalRef.current) scrollTerminalToBottomForUserInput(terminalRef.current)
     const writer = ptyInputRef.current
     if (writer) {
       writer.write(data)
@@ -549,6 +551,7 @@ export const TerminalPanel = memo(function TerminalPanel({
     let imeCompositionEndTimer: ReturnType<typeof setTimeout> | null = null
     const writeTerminalUserInput = (phase: string, data: string) => {
       traceTerminalInputData(phase, data)
+      scrollTerminalToBottomForUserInput(terminal)
       ptyInput.write(data)
       if (terminalType === 'code-agent') {
         workspaceStore.markHasUserInput(terminalId)
@@ -800,6 +803,7 @@ export const TerminalPanel = memo(function TerminalPanel({
         event.preventDefault()
         if (!useDirectTerminalKeyInput) {
           traceTerminalInputData('key-override', inputOverride)
+          scrollTerminalToBottomForUserInput(terminal)
           ptyInput.write(inputOverride)
           if (terminalType === 'code-agent') {
             workspaceStore.markHasUserInput(terminalId)

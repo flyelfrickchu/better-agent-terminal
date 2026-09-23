@@ -135,6 +135,22 @@ export function shouldUseDirectTerminalKeyInput(platform?: TerminalInputPlatform
   return platform !== 'win32'
 }
 
+export interface ScrollableTerminalLike {
+  buffer: { active: { viewportY: number; baseY: number } }
+  scrollToBottom(): void
+}
+
+// Direct key input and host paste write to the PTY without going through
+// xterm (which also runs with disableStdin), so xterm's scrollOnUserInput
+// never fires. Without this, a terminal scrolled up even one line keeps its
+// viewport pinned while the next command's output lands below it.
+export function scrollTerminalToBottomForUserInput(terminal: ScrollableTerminalLike): void {
+  const buffer = terminal.buffer.active
+  if (buffer.viewportY !== buffer.baseY) {
+    terminal.scrollToBottom()
+  }
+}
+
 export function shouldBlockForImeComposition(
   event: TerminalKeyEventLike,
   imeComposing: boolean,

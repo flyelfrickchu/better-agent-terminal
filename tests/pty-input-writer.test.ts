@@ -10,6 +10,7 @@ import {
   getTerminalKeyInput,
   getTerminalKeyInputOverride,
   isPrintableTerminalInputData,
+  scrollTerminalToBottomForUserInput,
   shouldTraceTerminalInputData,
   shouldTraceTerminalKeyEvent,
   shouldBlockForImeComposition,
@@ -398,6 +399,26 @@ async function main() {
         isSpace: false,
       },
     )
+  }
+
+  {
+    // Direct key input bypasses xterm (disableStdin), so xterm's own
+    // scrollOnUserInput never runs; typing must bring the view back down.
+    const makeTerminal = (viewportY: number, baseY: number) => {
+      const calls: string[] = []
+      return {
+        calls,
+        buffer: { active: { viewportY, baseY } },
+        scrollToBottom: () => { calls.push('scrollToBottom') },
+      }
+    }
+    const scrolledUp = makeTerminal(86, 151)
+    scrollTerminalToBottomForUserInput(scrolledUp)
+    assert.deepEqual(scrolledUp.calls, ['scrollToBottom'])
+
+    const atBottom = makeTerminal(151, 151)
+    scrollTerminalToBottomForUserInput(atBottom)
+    assert.deepEqual(atBottom.calls, [])
   }
 
   console.info('pty input writer tests passed')
