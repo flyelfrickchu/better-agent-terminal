@@ -797,6 +797,12 @@ fn configure_per_terminal_history(
 fn configure_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Keep any Claude CLI started in this PTY (including one typed into a plain
+    // shell) on its main-screen renderer. The fullscreen renderer uses the alt
+    // screen, where xterm has no scrollback, so the host scrollbar goes dead.
+    // The env var outranks `tui` in ~/.claude/settings.json; custom_env can
+    // still override it.
+    cmd.env("CLAUDE_CODE_NO_FLICKER", "0");
 }
 
 fn new_shell_command(shell: &str) -> CommandBuilder {
@@ -2581,6 +2587,13 @@ mod tests {
         assert_eq!(
             cmd.get_env("COLORTERM").and_then(|value| value.to_str()),
             Some("truecolor")
+        );
+        // A `claude` typed into a plain shell must stay on the main screen so
+        // xterm keeps scrollback, even if ~/.claude/settings.json picks fullscreen.
+        assert_eq!(
+            cmd.get_env("CLAUDE_CODE_NO_FLICKER")
+                .and_then(|value| value.to_str()),
+            Some("0")
         );
     }
 
