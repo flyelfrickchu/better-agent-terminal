@@ -340,6 +340,57 @@ For an unsigned local installer/package check, use:
 pnpm run tauri:build:debug
 ```
 
+### Rebuild the Qt/KDE IDE Version (`dev_qt`)
+
+The native Linux frontend uses Qt 6 Widgets, KDE Frameworks 6, and embedded
+Konsole terminals. This version is under active migration; full feature parity
+with the React UI is still in progress.
+
+On Kubuntu 26.04, install Node.js 22+, Rust/Cargo, and these build/runtime packages:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential \
+                        pkg-config libssl-dev \
+                        cmake qt6-base-dev qt6-websockets-dev \
+                        libkf6parts-dev libkf6coreaddons-dev konsole-kpart
+```
+
+From the repository root, switch to the native UI branch and build:
+
+```bash
+git switch dev_qt
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run qt:build
+pnpm run qt:start
+```
+
+`qt:build` builds both the headless Rust host at
+`src-tauri/target/qt/debug/bat-server` and the native UI at
+`qt-ui/build/better-agent-terminal-qt`. `qt:start` launches the UI with that host.
+After changing source files, close the app, rerun `pnpm run qt:build`, and restart
+with `pnpm run qt:start`.
+
+To rebuild only the Qt frontend when the Rust host is already built:
+
+```bash
+cmake -S qt-ui -B qt-ui/build -DCMAKE_BUILD_TYPE=Debug
+cmake --build qt-ui/build -j2
+pnpm run qt:test
+pnpm run qt:start
+```
+
+For an end-to-end check of Konsole and the local host:
+
+```bash
+QT_QPA_PLATFORM=offscreen qt-ui/build/better-agent-terminal-qt \
+--server src-tauri/target/qt/debug/bat-server --smoke-test
+```
+
+See [the native Qt/KDE guide](qt-ui/README.md) for workspace, terminal, settings,
+Git, and remote-host usage.
+
 ### Option 5: Quick Install (Script)
 
 Run the following command in your terminal (macOS, Linux, or Windows with Git Bash/MSYS2):
