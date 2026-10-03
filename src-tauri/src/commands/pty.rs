@@ -810,6 +810,16 @@ fn new_shell_command(shell: &str) -> CommandBuilder {
     {
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("SHELL", shell);
+        if Path::new(shell).file_name().and_then(|name| name.to_str()) == Some("bash") {
+            // Bash imports this function into BAT's shell without editing the
+            // user's startup files. A manually typed `codex` must preserve
+            // scrollback too. Use a config override so an explicit
+            // --no-alt-screen flag from the preset is not duplicated.
+            cmd.env(
+                "BASH_FUNC_codex%%",
+                "() { command codex -c 'tui.alternate_screen=\"never\"' \"$@\"; }",
+            );
+        }
         cmd
     }
     #[cfg(not(target_family = "unix"))]
@@ -2555,6 +2565,42 @@ mod tests {
         assert!(root.join(".zprofile").exists());
         assert!(root.join(".zlogin").exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn bash_codex_function_preserves_arguments_and_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "bat-codex-shell-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex");
+        fs::write(&executable, "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\nexit 7\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = new_shell_command("/bin/bash");
+        let output = std::process::Command::new("/bin/bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "codex resume 'session with spaces' --no-alt-screen",
+            ])
+            .env("PATH", &root)
+            .env("BASH_FUNC_codex%%", cmd.get_env("BASH_FUNC_codex%%").unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "<-c>\n<tui.alternate_screen=\"never\">\n<resume>\n<session with spaces>\n<--no-alt-screen>\n"
+        );
+        assert!(new_shell_command("/bin/zsh")
+            .get_env("BASH_FUNC_codex%%")
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_family = "unix")]

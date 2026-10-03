@@ -159,9 +159,11 @@ function mergeEnvVars(global: EnvVariable[] = [], workspace: EnvVariable[] = [])
 
 function buildAgentAutoCommand(presetId: string, settings: ReturnType<typeof settingsStore.getSettings>): string | null {
   if (presetId === 'codex-cli') {
+    // Inline mode preserves xterm scrollback; the alternate screen has no
+    // history for the terminal scrollbar to navigate.
     return settings.allowBypassPermissions
-      ? 'codex --yolo'
-      : 'codex'
+      ? 'codex --no-alt-screen --yolo'
+      : 'codex --no-alt-screen'
   }
   const preset = getAgentPreset(presetId)
   return preset?.command || null
