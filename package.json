@@ -5,6 +5,9 @@
   "author": "TonyQ CO., LTD.",
   "packageManager": "pnpm@10.33.2",
   "scripts": {
+    "qt:build": "node scripts/build-qt.mjs",
+    "qt:start": "qt-ui/build/better-agent-terminal-qt --server src-tauri/target/qt/debug/bat-server",
+    "qt:test": "ctest --test-dir qt-ui/build --output-on-failure --timeout 30",
     "dev": "pnpm run tauri:dev:local",
     "compile": "vite build",
     "start": "pnpm run tauri:dev",

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Better Agent Terminal (Qt)
+Comment=Agent workspaces with embedded Konsole terminals
+Exec=better-agent-terminal-qt
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;TerminalEmulator;
+StartupWMClass=better-agent-terminal-qt
