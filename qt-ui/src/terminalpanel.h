@@ -10,6 +10,7 @@ public:
     explicit TerminalPanel(const QString &directory, const QString &program = {},
                            const QStringList &arguments = {}, QWidget *parent = nullptr,
                            const QString &profile = {});
+    ~TerminalPanel() override;
     bool available() const { return !m_part.isNull(); }
     void sendInput(const QString &text);
     QStringList availableProfiles() const;

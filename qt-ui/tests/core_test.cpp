@@ -3,6 +3,17 @@
 #include "terminalpanel.h"
 #include "mainwindow.h"
 #include "settingsdialog.h"
+#include "gitpanel.h"
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTreeWidget>
+#include <QListWidget>
+#include <QPlainTextEdit>
+#include <QSplitter>
+#include <QStackedWidget>
+#include <QAbstractButton>
+#include <QTextBlock>
+#include <QTextLayout>
 #include <QComboBox>
 #include <QLineEdit>
 #include <QSpinBox>
@@ -24,6 +35,83 @@
 class CoreTest : public QObject {
     Q_OBJECT
 private slots:
+    void gitStaysInsideWorkspaceWithSessions() {
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        auto *sessions = window.m_pages;
+        auto *sessionTabs = new QTabWidget(sessions);
+        auto *session = new QLineEdit("Session input is retained", sessionTabs);
+        sessionTabs->addTab(session, "Existing session");
+        sessions->addWidget(sessionTabs);
+        sessions->setCurrentWidget(sessionTabs);
+        const auto dialogs = window.findChildren<QDialog *>().size();
+        window.showGit();
+        QCOMPARE(window.m_workspaceViews->currentIndex(), 1);
+        QCOMPARE(window.findChildren<QDialog *>().size(), dialogs);
+        QVERIFY(!window.m_gitPanel->isWindow());
+        QCOMPARE(window.m_gitPanel->parentWidget(), window.m_workspaceSplitter);
+        QCOMPARE(window.m_pages, sessions);
+        QCOMPARE(sessions->currentWidget(), sessionTabs);
+        QCOMPARE(session->text(), QString("Session input is retained"));
+        window.m_workspaceViews->setCurrentIndex(0);
+        QVERIFY(window.m_gitPanel->isHidden());
+        QCOMPARE(window.m_pages, sessions);
+        QCOMPARE(sessions->currentWidget(), sessionTabs);
+        QCOMPARE(sessionTabs->count(), 1);
+        window.showGit();
+        auto *close = qobject_cast<QAbstractButton *>(window.m_workspaceViews->tabButton(1, QTabBar::RightSide));
+        if (!close) close = qobject_cast<QAbstractButton *>(window.m_workspaceViews->tabButton(1, QTabBar::LeftSide));
+        QVERIFY(close);
+        close->click();
+        QCOMPARE(window.m_workspaceViews->count(), 1);
+        QCOMPARE(window.m_workspaceViews->currentIndex(), 0);
+        QVERIFY(window.m_gitPanel->isHidden());
+        QCOMPARE(sessions->currentWidget(), sessionTabs);
+        QCOMPARE(session->text(), QString("Session input is retained"));
+        QVERIFY(!window.m_workspaceViews->tabButton(0, QTabBar::LeftSide));
+        QVERIFY(!window.m_workspaceViews->tabButton(0, QTabBar::RightSide));
+        window.showGit();
+        QCOMPARE(window.m_workspaceViews->count(), 2);
+        QCOMPARE(window.m_workspaceViews->currentIndex(), 1);
+    }
+    void gitLongTextWrapsWithinColumns() {
+        HostClient host;
+        GitPanel panel(&host);
+        panel.resize(1000, 500);
+        panel.show();
+        auto *commits = panel.findChild<QListWidget *>("git-commits");
+        auto *files = panel.findChild<QTreeWidget *>("git-files");
+        auto *diff = panel.findChild<QPlainTextEdit *>("git-diff");
+        auto *content = panel.findChild<QPlainTextEdit *>("git-file-content");
+        const QString longText(600, 'a');
+        auto *commit = new QListWidgetItem(longText, commits);
+        auto *file = new QTreeWidgetItem(files, {"M", longText});
+        diff->setPlainText("+" + longText);
+        content->setPlainText(longText);
+        QTRY_VERIFY(diff->document()->firstBlock().layout()->lineCount() > 1);
+        QTRY_VERIFY(commits->visualItemRect(commit).height() > commits->fontMetrics().height() * 2);
+        QTRY_VERIFY(files->visualItemRect(file).height() > files->fontMetrics().height() * 2);
+        QCOMPARE(diff->toPlainText(), "+" + longText);
+        panel.findChild<QTabWidget *>("git-previews")->setCurrentIndex(1);
+        QTRY_VERIFY(content->document()->firstBlock().layout()->lineCount() > 1);
+        QCOMPARE(content->toPlainText(), longText);
+    }
+    void gitDiffColorsAndQuotedPaths() {
+        for (bool dark : {false, true}) {
+            const auto add = DiffHighlighter::lineFormat("+new", dark);
+            const auto remove = DiffHighlighter::lineFormat("-old", dark);
+            const auto header = DiffHighlighter::lineFormat("+++ b/file", dark);
+            const auto hunk = DiffHighlighter::lineFormat("@@ -1 +1 @@", dark);
+            QVERIFY(!add.isEmpty()); QVERIFY(!remove.isEmpty()); QVERIFY(!hunk.isEmpty());
+            QVERIFY(add.foreground().color() != remove.foreground().color());
+            QVERIFY(add.foreground().color() != header.foreground().color());
+            QVERIFY(DiffHighlighter::lineFormat(" unchanged", dark).isEmpty());
+        }
+        QCOMPARE(GitPanel::filePath({{"status", "M"}, {"file", "a file.cpp"}}), QString("a file.cpp"));
+        QCOMPARE(GitPanel::filePath({{"status", "R100"}, {"file", "old.cpp\tnew.cpp"}}), QString("new.cpp"));
+        QCOMPARE(GitPanel::filePath({{"status", "R"}, {"file", "\"old name\" -> \"new name\""}}), QString("new name"));
+        QCOMPARE(GitPanel::filePath({{"status", "M"}, {"file", "\"caf\\303\\251.txt\""}}), QString::fromUtf8("café.txt"));
+    }
     void settingsHandleFreshAndInvalidHosts() {
         QJsonObject settings; QString error;
         QVERIFY(SettingsDialog::decodeSettings(QJsonValue(QJsonValue::Null), settings, error));
@@ -106,6 +194,36 @@ private slots:
         transcript.finishTurn();
         QCOMPARE(transcript.markdown().count("Main answer"), 1);
     }
+    void terminalTeardownDoesNotEmitProcessExit() {
+        QTemporaryDir directory;
+        for (bool autoClose : {false, true}) {
+            auto *window = new MainWindow(directory.path());
+            window->m_settings.insert("closeTerminalAfterProcessExit", autoClose);
+            auto *tabs = new QTabWidget(window->m_pages);
+            window->m_pages->addWidget(tabs);
+            window->m_workspaceTabs.insert("workspace", tabs);
+            window->createTab({{"id", "terminal"}, {"workspaceId", "workspace"},
+                {"kind", "terminal"}, {"cwd", directory.path()}}, false);
+            auto *terminal = qobject_cast<TerminalPanel *>(tabs->widget(0));
+            QVERIFY(terminal); QVERIFY(terminal->available());
+            int exits = 0;
+            connect(terminal, &TerminalPanel::exited, this, [&exits] { ++exits; });
+            // Exercise workspace removal while the window is alive, then app
+            // teardown with another live shell and the real exit callback.
+            window->clearPages();
+            QCOMPARE(exits, 0);
+            tabs = new QTabWidget(window->m_pages);
+            window->m_pages->addWidget(tabs);
+            window->m_workspaceTabs.insert("workspace", tabs);
+            window->createTab({{"id", "terminal"}, {"workspaceId", "workspace"},
+                {"kind", "terminal"}, {"cwd", directory.path()}}, false);
+            terminal = qobject_cast<TerminalPanel *>(tabs->widget(0));
+            QVERIFY(terminal); QVERIFY(terminal->available());
+            connect(terminal, &TerminalPanel::exited, this, [&exits] { ++exits; });
+            delete window;
+            QCOMPARE(exits, 0);
+        }
+    }
     void konsoleShellAndProgram() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -177,6 +295,21 @@ private slots:
                         savedSettings = QJsonDocument::fromJson(frame["params"].toObject()["data"].toString().toUtf8()).object();
                         response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", true}};
                     }
+                } else if (frame["channel"].toString().startsWith("git:")) {
+                    const auto channel = frame["channel"].toString();
+                    QJsonValue result;
+                    if (channel == "git:getRoot") result = "/repo";
+                    else if (channel == "git:status") result = QJsonArray{
+                        QJsonObject{{"status", "M"}, {"file", "edited.cpp"}},
+                        QJsonObject{{"status", "??"}, {"file", "new file.txt"}}};
+                    else if (channel == "git:log") result = QJsonArray{QJsonObject{
+                        {"hash", QString(40, 'a')}, {"message", "Test commit"}, {"author", "Author"}, {"date", "2026-10-03T12:00:00Z"}}};
+                    else if (channel == "git:diff-files") result = QJsonArray{QJsonObject{{"status", "M"}, {"file", "committed.cpp"}}};
+                    else if (channel == "git:diff") result = frame["params"].toObject()["filePath"] == "new file.txt"
+                        ? QString() : QString("diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new");
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", result}};
+                } else if (frame["channel"] == "fs:readFile") {
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", QJsonObject{{"content", "new content\n"}}}};
                 } else return; // Exercise timeouts / abandoned callers.
                 peer->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact)));
             });
@@ -211,6 +344,23 @@ private slots:
         QTRY_COMPARE(settingsSaved.count(), 1);
         QCOMPARE(savedSettings["defaultClaudeModel"].toString(), QString("changed"));
         QVERIFY(savedSettings["preserved"].toBool());
+        GitPanel gitPanel(&client);
+        gitPanel.setWorkspace("/repo/subfolder"); gitPanel.refresh();
+        auto *commits = gitPanel.findChild<QListWidget *>("git-commits");
+        auto *files = gitPanel.findChild<QTreeWidget *>("git-files");
+        auto *diff = gitPanel.findChild<QPlainTextEdit *>("git-diff");
+        auto *fileContent = gitPanel.findChild<QPlainTextEdit *>("git-file-content");
+        QTRY_COMPARE(commits->count(), 2);
+        QTRY_COMPARE(files->topLevelItemCount(), 2);
+        QTRY_VERIFY(diff->toPlainText().contains("+new"));
+        QTRY_VERIFY(fileContent->toPlainText().contains("new content"));
+        files->setCurrentItem(files->topLevelItem(1));
+        QTRY_VERIFY(diff->toPlainText().contains("+++ b/new file.txt"));
+        QVERIFY(diff->toPlainText().contains("+new content"));
+        commits->setCurrentRow(1);
+        QTRY_COMPARE(files->topLevelItemCount(), 1);
+        QCOMPARE(files->topLevelItem(0)->text(1), QString("committed.cpp"));
+        QTRY_VERIFY(diff->toPlainText().contains("-old"));
         const auto sendEvent = [&](const QString &context) {
             peer->sendTextMessage(QString::fromUtf8(QJsonDocument(QJsonObject{{"type", "event"},
                 {"contextId", context}, {"channel", "agent:stream"}, {"params", QJsonObject{{"sessionId", "s1"}}}}).toJson()));

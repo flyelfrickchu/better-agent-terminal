@@ -13,6 +13,7 @@ add_library(bat-qt-core STATIC
     src/transcript.cpp src/transcript.h
     src/terminalpanel.cpp src/terminalpanel.h
     src/settingsdialog.cpp src/settingsdialog.h
+    src/gitpanel.cpp src/gitpanel.h
 )
 target_link_libraries(bat-qt-core PUBLIC Qt6::Widgets Qt6::Network Qt6::WebSockets
     KF6::CoreAddons KF6::Parts)

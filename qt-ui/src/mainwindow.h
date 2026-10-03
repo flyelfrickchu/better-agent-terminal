@@ -14,6 +14,9 @@ class QTextBrowser;
 class QTreeWidget;
 class QTreeWidgetItem;
 class QCloseEvent;
+class QTabBar;
+class QSplitter;
+class GitPanel;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -77,6 +80,9 @@ private:
     QComboBox *m_profilePicker;
     QListWidget *m_workspaces;
     QStackedWidget *m_pages;
+    QTabBar *m_workspaceViews;
+    QSplitter *m_workspaceSplitter;
+    GitPanel *m_gitPanel;
     QTreeWidget *m_files;
     QTextBrowser *m_preview;
     QHash<QString, QTabWidget *> m_workspaceTabs;

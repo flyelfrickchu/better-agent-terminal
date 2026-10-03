@@ -37,6 +37,13 @@ TerminalPanel::TerminalPanel(const QString &directory, const QString &program,
     }
 }
 
+TerminalPanel::~TerminalPanel() {
+    // KPart destruction during widget teardown is not a process-exit event.
+    // Disconnect before QWidget destroys children, when ancestor tabs may
+    // already be partially destroyed and this panel's members are gone.
+    if (m_part) QObject::disconnect(m_part.data(), nullptr, this, nullptr);
+}
+
 void TerminalPanel::sendInput(const QString &text) {
     if (m_part) {
         if (auto *terminal = qobject_cast<TerminalInterface *>(m_part.data())) terminal->sendInput(text);

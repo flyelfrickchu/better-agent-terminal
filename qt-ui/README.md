@@ -41,8 +41,18 @@ Terminal shell, font, and colors are managed by the selected Konsole profile.
 Unknown settings and the built-in status line configuration are preserved.
 Loading, connection, validation, and save failures are shown in the dialog.
 
+**Git** switches to an embedded workspace view above the running terminal/agent
+sessions. Its three columns show commits (including uncommitted changes), changed
+files, and Diff/File previews. Select a commit and then a file to browse its diff;
+the File tab shows the current working copy, matching the original UI. Added lines
+are green, deleted lines red, hunk headers blue, and file statuses are colored.
+Untracked text files are displayed as additions. **Refresh** reloads the repository;
+the **Terminal** tab restores the full session view without restarting sessions.
+
 This is an initial migration scaffold, not feature parity with the React UI.
 The configurable built-in status line, complete tool rendering, advanced agent
 controls, and remaining advanced settings still need migration. Native settings,
 history browsing, file previews, and Git views are available. Existing React
 and backend implementations are retained during migration.
+
+Git commit messages, file paths, diffs, and file contents wrap to the available column width, including long strings without spaces. Use the Git tab’s × button to close the view and return to Terminal; the Git toolbar button reopens it without interrupting sessions.

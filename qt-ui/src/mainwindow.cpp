@@ -2,6 +2,9 @@
 #include "agentpanel.h"
 #include "terminalpanel.h"
 #include "settingsdialog.h"
+#include "gitpanel.h"
+#include <QTabBar>
+#include <QSplitter>
 #include <QStyle>
 #include <QApplication>
 #include <QCloseEvent>
@@ -37,11 +40,6 @@
 
 namespace {
 QString newId() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
-QString valueText(const QJsonValue &value) {
-    if (value.isString()) return value.toString();
-    if (value.isArray()) return QString::fromUtf8(QJsonDocument(value.toArray()).toJson(QJsonDocument::Indented));
-    return QString::fromUtf8(QJsonDocument(value.toObject()).toJson(QJsonDocument::Indented));
-}
 }
 
 MainWindow::MainWindow(const QString &dataDirectory, QWidget *parent)
@@ -164,7 +162,39 @@ void MainWindow::buildUi() {
     connect(m_files, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item) {
         if (!item->data(0, Qt::UserRole + 1).toBool()) previewFile(item->data(0, Qt::UserRole).toString());
     });
-    m_pages = new QStackedWidget(this); setCentralWidget(m_pages);
+    auto *workspaceView = new QWidget(this);
+    auto *workspaceLayout = new QVBoxLayout(workspaceView);
+    workspaceLayout->setContentsMargins(0, 0, 0, 0);
+    m_workspaceViews = new QTabBar(workspaceView);
+    m_workspaceViews->setObjectName("workspace-views");
+    m_workspaceViews->setExpanding(false);
+    m_workspaceViews->addTab(tr("Terminal"));
+    m_workspaceViews->addTab(tr("Git"));
+    m_workspaceViews->setTabsClosable(true);
+    m_workspaceViews->setTabButton(0, QTabBar::LeftSide, nullptr);
+    m_workspaceViews->setTabButton(0, QTabBar::RightSide, nullptr);
+    workspaceLayout->addWidget(m_workspaceViews);
+    m_workspaceSplitter = new QSplitter(Qt::Vertical, workspaceView);
+    m_gitPanel = new GitPanel(&m_host, m_workspaceSplitter);
+    m_pages = new QStackedWidget(m_workspaceSplitter);
+    m_workspaceSplitter->addWidget(m_gitPanel);
+    m_workspaceSplitter->addWidget(m_pages);
+    m_gitPanel->hide();
+    workspaceLayout->addWidget(m_workspaceSplitter, 1);
+    setCentralWidget(workspaceView);
+    connect(m_workspaceViews, &QTabBar::currentChanged, this, [this](int index) {
+        if (index == 1) {
+            m_gitPanel->setWorkspace(currentDirectory());
+            m_gitPanel->show();
+            m_gitPanel->refresh();
+            m_workspaceSplitter->setSizes({600, 250});
+        } else m_gitPanel->hide();
+    });
+    connect(m_workspaceViews, &QTabBar::tabCloseRequested, this, [this](int index) {
+        if (index != 1) return;
+        m_workspaceViews->setCurrentIndex(0);
+        m_workspaceViews->removeTab(index);
+    });
     auto *welcome = new QLabel(tr("Add a workspace to open a Konsole terminal or agent session."), m_pages);
     welcome->setAlignment(Qt::AlignCenter); welcome->setWordWrap(true); m_pages->addWidget(welcome);
     auto *previewDock = new QDockWidget(tr("File preview"), this); previewDock->setObjectName("preview-dock");
@@ -333,6 +363,7 @@ void MainWindow::showWorkspace(const QString &id, bool save) {
     if (auto *tabs = m_workspaceTabs.value(id)) m_pages->setCurrentWidget(tabs);
     else m_pages->setCurrentIndex(0);
     setWindowTitle(tr("%1 — Better Agent Terminal Qt").arg(activeWorkspace()["name"].toString("Workspaces")));
+    m_gitPanel->setWorkspace(currentDirectory());
     if (m_filesContext != m_host.contextId() || m_filesDirectory != currentDirectory()) refreshFiles();
     if (save && changed && !m_loading) m_saveTimer.start();
 }
@@ -434,6 +465,7 @@ void MainWindow::createTab(const QJsonObject &descriptor, bool save) {
         auto *terminal = new TerminalPanel(descriptor["cwd"].toString(), program, arguments, tabs,
             m_settings["qtUi"].toObject()["konsoleProfile"].toString());
         connect(terminal, &TerminalPanel::exited, this, [this, tabs, terminal] {
+            if (m_closing) return;
             if (m_settings["closeTerminalAfterProcessExit"].toBool()) {
                 const int index = tabs->indexOf(terminal);
                 if (index >= 0) { tabs->removeTab(index); terminal->deleteLater(); if (!m_loading) m_saveTimer.start(); }
@@ -545,16 +577,9 @@ void MainWindow::previewFile(const QString &path) {
         });
 }
 void MainWindow::showGit() {
-    if (currentDirectory().isEmpty()) return;
-    auto *dialog = new QDialog(this); dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowTitle(tr("Git — %1").arg(currentDirectory())); dialog->resize(850, 600);
-    auto *layout = new QVBoxLayout(dialog); auto *tabs = new QTabWidget(dialog); layout->addWidget(tabs);
-    for (const QString &operation : {QString("status"), QString("log"), QString("diff")}) {
-        auto *text = new QPlainTextEdit(tabs); text->setReadOnly(true); tabs->addTab(text, operation);
-        m_host.invoke("git:" + operation, {{"cwd", currentDirectory()}}, text,
-            [text](const QJsonValue &value, const QString &error) { text->setPlainText(error.isEmpty() ? valueText(value) : error); });
-    }
-    dialog->show();
+    if (m_workspaceViews->count() == 1) m_workspaceViews->addTab(tr("Git"));
+    if (m_workspaceViews->currentIndex() == 1) m_gitPanel->refresh();
+    else m_workspaceViews->setCurrentIndex(1);
 }
 void MainWindow::showSettings() {
     QStringList profiles;
@@ -653,6 +678,7 @@ void MainWindow::clearPages() {
     m_loading = true;
     for (auto *tabs : std::as_const(m_workspaceTabs)) { m_pages->removeWidget(tabs); delete tabs; }
     m_workspaceTabs.clear(); m_workspaces->clear(); m_files->clear();
+    m_gitPanel->setWorkspace({});
     m_filesContext.clear(); m_filesDirectory.clear(); ++m_filesGeneration;
     m_workspaceId.clear(); m_snapshot = {}; m_loading = false;
 }
