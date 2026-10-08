@@ -159,6 +159,38 @@ private slots:
         window.showWorkspace("workspace-1");
         QVERIFY(!window.m_saveTimer.isActive());
     }
+    void legacyWorkspaceReloadKeepsLiveKonsole() {
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        const QJsonObject workspace{{"id", "workspace-1"}, {"name", "Test"}, {"folderPath", directory.path()}};
+        const QJsonObject descriptor{{"id", "terminal-1"}, {"workspaceId", "workspace-1"},
+            {"kind", "terminal"}, {"cwd", directory.path()}};
+        const QJsonObject qt{{"activeWorkspaceId", "workspace-1"}, {"tabs", QJsonArray{descriptor}}};
+        const QJsonObject snapshot{{"workspaces", QJsonArray{workspace}}, {"qtUi", qt}};
+        window.applySnapshot(snapshot);
+        auto *tabs = window.m_workspaceTabs.value("workspace-1");
+        QPointer<TerminalPanel> panel = qobject_cast<TerminalPanel *>(tabs->widget(0));
+        QVERIFY(panel); QVERIFY(panel->available());
+        auto *terminal = qobject_cast<TerminalInterface *>(panel->findChild<KParts::ReadOnlyPart *>());
+        QVERIFY(terminal);
+        QTRY_VERIFY_WITH_TIMEOUT(terminal->terminalProcessId() > 0, 5000);
+        const auto pid = terminal->terminalProcessId();
+        // Legacy snapshots have no authority over the local Qt session list.
+        window.applySnapshot({{"workspaces", QJsonArray{workspace}}});
+        QVERIFY(panel);
+        QCOMPARE(tabs->count(), 1);
+        QCOMPARE(tabs->widget(0), panel.data());
+        QCOMPARE(terminal->terminalProcessId(), pid);
+        panel->sendInput("printf alive > reload-alive.txt\n");
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(directory.filePath("reload-alive.txt")), 5000);
+        window.applySnapshot(snapshot);
+        QCOMPARE(tabs->widget(0), panel.data());
+        // An explicit empty Qt tab list still closes the saved terminal.
+        window.applySnapshot({{"workspaces", QJsonArray{workspace}},
+            {"qtUi", QJsonObject{{"tabs", QJsonArray{}}}}});
+        QVERIFY(!panel);
+        QCOMPARE(tabs->count(), 0);
+    }
     void validatesPinnedUrls() {
         const QString fingerprint(64, 'a');
         QVERIFY(HostClient::validateConnectionUrl(QUrl("wss://localhost:9876/?token=test&fp=" + QString("AA%3A").repeated(31) + "AA")).isEmpty());

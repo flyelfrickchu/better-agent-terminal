@@ -683,17 +683,23 @@ fn empty_workspace_state() -> Value {
 }
 
 fn snapshot_from_workspace(profile: &ProfileEntry, workspace: Value) -> Value {
+    let mut window = json!({
+        "workspaces": workspace.get("workspaces").cloned().unwrap_or_else(|| json!([])),
+        "activeWorkspaceId": workspace.get("activeWorkspaceId").cloned().unwrap_or(Value::Null),
+        "activeGroup": workspace.get("activeGroup").cloned().unwrap_or(Value::Null),
+        "terminals": workspace.get("terminals").cloned().unwrap_or_else(|| json!([])),
+        "activeTerminalId": workspace.get("activeTerminalId").cloned().unwrap_or(Value::Null),
+    });
+    // Native Qt tabs have their own additive workspace data. Keep it opaque
+    // so future Qt fields survive the same profile persistence path.
+    if let Some(qt_ui) = workspace.get("qtUi") {
+        window["qtUi"] = qt_ui.clone();
+    }
     json!({
         "id": profile.id,
         "name": profile.name,
         "version": 2,
-        "windows": [{
-            "workspaces": workspace.get("workspaces").cloned().unwrap_or_else(|| json!([])),
-            "activeWorkspaceId": workspace.get("activeWorkspaceId").cloned().unwrap_or(Value::Null),
-            "activeGroup": workspace.get("activeGroup").cloned().unwrap_or(Value::Null),
-            "terminals": workspace.get("terminals").cloned().unwrap_or_else(|| json!([])),
-            "activeTerminalId": workspace.get("activeTerminalId").cloned().unwrap_or(Value::Null),
-        }],
+        "windows": [window],
     })
 }
 
@@ -1005,7 +1011,7 @@ fn migrate_snapshot(raw: Value) -> Option<Value> {
         return Some(raw);
     }
     if raw.get("version").and_then(Value::as_i64) == Some(1) {
-        return Some(json!({
+        let mut migrated = json!({
             "id": raw.get("id").cloned().unwrap_or(Value::Null),
             "name": raw.get("name").cloned().unwrap_or(Value::Null),
             "version": 2,
@@ -1016,7 +1022,11 @@ fn migrate_snapshot(raw: Value) -> Option<Value> {
                 "terminals": raw.get("terminals").cloned().unwrap_or_else(|| json!([])),
                 "activeTerminalId": raw.get("activeTerminalId").cloned().unwrap_or(Value::Null),
             }],
-        }));
+        });
+        if let Some(qt_ui) = raw.get("qtUi") {
+            migrated["windows"][0]["qtUi"] = qt_ui.clone();
+        }
+        return Some(migrated);
     }
     None
 }
@@ -1037,13 +1047,17 @@ fn write_snapshot_at(dir: &Path, profile_id: &str, snapshot: &Value) -> std::io:
 
 fn workspace_from_first_snapshot_window(snapshot: &Value) -> Option<Value> {
     let first = snapshot.get("windows")?.as_array()?.first()?;
-    Some(json!({
+    let mut workspace = json!({
         "workspaces": first.get("workspaces").cloned().unwrap_or_else(|| json!([])),
         "activeWorkspaceId": first.get("activeWorkspaceId").cloned().unwrap_or(Value::Null),
         "activeGroup": first.get("activeGroup").cloned().unwrap_or(Value::Null),
         "terminals": first.get("terminals").cloned().unwrap_or_else(|| json!([])),
         "activeTerminalId": first.get("activeTerminalId").cloned().unwrap_or(Value::Null),
-    }))
+    });
+    if let Some(qt_ui) = first.get("qtUi") {
+        workspace["qtUi"] = qt_ui.clone();
+    }
+    Some(workspace)
 }
 
 fn seed_default_snapshot_if_missing(dir: &Path, app: &HostContext, index: &ProfileIndex) {
@@ -2039,7 +2053,41 @@ mod tests {
         let workspace = workspace_from_first_snapshot_window(&loaded).unwrap();
         assert_eq!(workspace["workspaces"][0]["id"], "w1");
         assert_eq!(workspace["activeTerminalId"], "t1");
+        assert!(workspace.get("qtUi").is_none());
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_qt_workspace_tabs() {
+        let dir = temp_profile_dir("qt-snapshot");
+        let profile = profile_from_options("local-qt".into(), "Qt".into(), None);
+        let qt_ui = json!({
+            "activeWorkspaceId": "w1",
+            "tabs": [{"id": "qt-t1", "workspaceId": "w1", "kind": "terminal", "cwd": "/tmp"}],
+            "futureOption": {"enabled": true},
+        });
+        let snapshot = snapshot_from_workspace(&profile, json!({
+            "workspaces": [{"id": "w1"}],
+            "terminals": [{"id": "legacy-t1"}],
+            "qtUi": qt_ui,
+        }));
+        write_snapshot_at(&dir, &profile.id, &snapshot).unwrap();
+        let loaded = read_snapshot_at(&dir, &profile.id).unwrap();
+        let workspace = workspace_from_first_snapshot_window(&loaded).unwrap();
+        fs::remove_dir_all(dir).ok();
+        assert_eq!(workspace["qtUi"], qt_ui);
+        assert_eq!(workspace["terminals"][0]["id"], "legacy-t1");
+    }
+
+    #[test]
+    fn snapshot_migration_preserves_qt_workspace_tabs() {
+        let qt_ui = json!({"activeWorkspaceId": "w1", "tabs": [{"id": "qt-t1"}]});
+        let migrated = migrate_snapshot(json!({
+            "id": "default", "name": "Default", "version": 1,
+            "workspaces": [{"id": "w1"}], "terminals": [], "qtUi": qt_ui,
+        })).unwrap();
+        let workspace = workspace_from_first_snapshot_window(&migrated).unwrap();
+        assert_eq!(workspace["qtUi"], qt_ui);
     }
 
     #[test]

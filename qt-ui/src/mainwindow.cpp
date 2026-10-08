@@ -336,7 +336,9 @@ void MainWindow::applySnapshot(const QJsonObject &snapshot) {
     const auto savedTabs = qt["tabs"].toArray();
     QSet<QString> savedIds;
     for (const auto &entry : savedTabs) savedIds.insert(entry.toObject()["id"].toString());
-    for (auto *tabs : std::as_const(m_workspaceTabs)) {
+    // Legacy clients and snapshots do not carry Qt tabs. Only an explicit
+    // Qt tab list can remove local sessions; absence is not an empty list.
+    if (qt["tabs"].isArray()) for (auto *tabs : std::as_const(m_workspaceTabs)) {
         for (int i = tabs->count() - 1; i >= 0; --i) {
             auto *widget = tabs->widget(i);
             if (!savedIds.contains(widget->property("tabId").toString())) {
