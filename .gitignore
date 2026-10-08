@@ -43,3 +43,4 @@ graphify-*
 .claude/
 .codex/
 .cursor/
+.gemini/
