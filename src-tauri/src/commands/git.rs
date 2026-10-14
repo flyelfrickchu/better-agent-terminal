@@ -38,6 +38,10 @@ use tauri::{AppHandle, Manager, WebviewWindow};
 // maxBuffer (5 MiB) so a runaway repo can't OOM the renderer.
 const MAX_OUTPUT_BYTES: usize = 5 * 1024 * 1024;
 const REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(15);
+// A full status scan of a large checkout (an AOSP tree takes ~8 s warm) must
+// finish rather than time out into a misleading empty list. Stays below the
+// native Qt client's 30 s request timeout.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct GitLogEntry {
@@ -114,31 +118,51 @@ fn run_git(cwd: &str, args: &[&str], timeout: Duration) -> Option<String> {
     hide_console_window(&mut command);
     let mut child = command.spawn().ok()?;
 
+    // Drain stdout while git runs: output beyond the OS pipe buffer would
+    // otherwise block git until the timeout kills it.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buffer = Vec::new();
+        let read = (&mut stdout)
+            .take(MAX_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut buffer);
+        // Keep draining past the cap so git can still exit.
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        read.ok().map(|_| buffer)
+    });
+
     // Cheap timeout: poll try_wait every 25 ms.
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = reader.join();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
         }
-    }
+    };
 
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
+    let stdout = reader.join().ok().flatten()?;
+    if !status.success() {
         return None;
     }
-    if output.stdout.len() > MAX_OUTPUT_BYTES {
+    if stdout.len() > MAX_OUTPUT_BYTES {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Some(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 async fn run_git_blocking(cwd: String, args: Vec<String>, timeout: Duration) -> Option<String> {
@@ -519,7 +543,7 @@ pub(crate) async fn git_get_status_native(cwd: String) -> Vec<GitFileEntry> {
             "--porcelain".into(),
             "--untracked-files=all".into(),
         ],
-        Duration::from_secs(5),
+        STATUS_TIMEOUT,
     )
     .await
     {
@@ -753,5 +777,72 @@ mod tests {
             Duration::from_secs(1),
         )
         .is_none());
+    }
+
+    fn temp_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bat-git-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init failed");
+        dir
+    }
+
+    // Output beyond the OS pipe buffer (~64 KiB) must not stall git until the
+    // timeout kills it and the status silently reads as "0 files changed".
+    #[test]
+    fn status_reads_output_larger_than_the_pipe_buffer() {
+        let dir = temp_repo("large-status");
+        for i in 0..3000 {
+            std::fs::write(dir.join(format!("untracked_with_a_long_name_{i}.txt")), "").unwrap();
+        }
+        let entries = crate::async_rt::block_on(git_get_status_native(
+            dir.to_string_lossy().into_owned(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(entries.len(), 3000);
+    }
+
+    // Large checkouts (an AOSP tree takes ~8 s) must still report their
+    // changes instead of timing out into an empty list.
+    #[cfg(unix)]
+    #[test]
+    fn status_waits_for_a_slow_repository() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_repo("slow-status");
+        let hook = dir.join(".git").join("slow-fsmonitor.sh");
+        // git queries the hook twice per status; ~6 s total exceeds the old 5 s limit.
+        std::fs::write(&hook, "#!/bin/sh\nsleep 3\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ok = Command::new("git")
+            .args(["config", "core.fsmonitor", &hook.to_string_lossy()])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git config failed");
+        std::fs::write(dir.join("changed.txt"), "x").unwrap();
+        let entries = crate::async_rt::block_on(git_get_status_native(
+            dir.to_string_lossy().into_owned(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            entries,
+            vec![GitFileEntry {
+                status: "??".into(),
+                file: "changed.txt".into()
+            }]
+        );
     }
 }
