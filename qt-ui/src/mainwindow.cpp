@@ -686,7 +686,7 @@ void MainWindow::clearPages() {
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
     const bool hasTerminals = !findChildren<TerminalPanel *>().isEmpty();
-    if ((hasRunningAgents() || hasTerminals) && QMessageBox::question(this, tr("Quit"),
+    if (!m_closing && (hasRunningAgents() || hasTerminals) && QMessageBox::question(this, tr("Quit"),
         tr("Quit and close local terminals? Agent sessions on an external host will remain there.")) != QMessageBox::Yes) {
         event->ignore(); return;
     }
@@ -704,4 +704,8 @@ void MainWindow::closeEvent(QCloseEvent *event) {
     }
     QSettings preferences; preferences.setValue("geometry", saveGeometry()); preferences.setValue("windowState", saveState());
     m_closing = true; m_reconnectTimer.stop(); event->accept();
+    // Hiding the last window can leave the event loop alive while KDE jobs
+    // hold quit locks. Explicit Quit must reach our destructor and stop the
+    // owned host and terminals. Queue it until this close event has finished.
+    QTimer::singleShot(0, qApp, &QCoreApplication::quit);
 }

@@ -24,6 +24,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
+#include <QEventLoopLocker>
+#include <QTextStream>
+#include <QAction>
 #include <QSignalSpy>
 #include <QSslCertificate>
 #include <QSslKey>
@@ -31,10 +34,115 @@
 #include <QTest>
 #include <QUrlQuery>
 #include <QWebSocketServer>
+#include <QMessageBox>
 
 class CoreTest : public QObject {
     Q_OBJECT
+public:
+    static int runQuitProbe(QApplication &app, bool cancelFirst, bool pendingSave) {
+        QTemporaryDir directory;
+        if (!directory.isValid()) return 10;
+        // KDE jobs may hold this lock after the last window is hidden. Quit
+        // must explicitly leave the event loop so owned processes are cleaned up.
+        QEventLoopLocker backgroundJob;
+        MainWindow window(directory.path());
+        window.m_server.start("/bin/sleep", {"60"});
+        if (!window.m_server.waitForStarted()) return 11;
+        auto *tabs = new QTabWidget(window.m_pages);
+        window.m_pages->addWidget(tabs);
+        window.m_workspaceTabs.insert("workspace", tabs);
+        window.createTab({{"id", "terminal"}, {"workspaceId", "workspace"},
+            {"kind", "terminal"}, {"cwd", directory.path()}}, false);
+        auto *panel = qobject_cast<TerminalPanel *>(tabs->widget(0));
+        auto *part = panel ? panel->findChild<KParts::ReadOnlyPart *>() : nullptr;
+        auto *terminal = part ? qobject_cast<TerminalInterface *>(part) : nullptr;
+        if (!terminal) return 12;
+        QAction *quit = nullptr;
+        for (auto *action : window.findChildren<QAction *>())
+            if (action->shortcut() == QKeySequence(QKeySequence::Quit)) quit = action;
+        if (!quit) return 13;
+        int confirmations = 0;
+        bool saveCompleted = !pendingSave;
+        QTimer answers;
+        connect(&answers, &QTimer::timeout, &window, [&] {
+            auto *dialog = qobject_cast<QMessageBox *>(app.activeModalWidget());
+            if (!dialog) return;
+            const bool cancel = cancelFirst && confirmations == 0;
+            ++confirmations;
+            dialog->button(cancel ? QMessageBox::No : QMessageBox::Yes)->click();
+            if (cancel) QTimer::singleShot(0, &window, [&] {
+                if (!window.isVisible() || window.m_server.state() != QProcess::Running) {
+                    app.exit(14); return;
+                }
+                QTextStream(stdout) << "CANCEL_PRESERVED" << Qt::endl;
+                quit->trigger();
+            });
+        });
+        answers.start(10);
+        QTimer ready;
+        connect(&ready, &QTimer::timeout, &window, [&] {
+            const auto shellPid = terminal->terminalProcessId();
+            if (shellPid <= 0) return;
+            ready.stop();
+            QTextStream(stdout) << "HOST_PID=" << window.m_server.processId()
+                                << "\nSHELL_PID=" << shellPid << Qt::endl;
+            if (pendingSave) {
+                window.m_saveInFlight = true;
+                QTimer::singleShot(250, &window, [&] {
+                    saveCompleted = true;
+                    window.m_saveInFlight = false;
+                });
+            }
+            quit->trigger();
+        });
+        ready.start(10);
+        QTimer::singleShot(4000, &app, [&] {
+            QTextStream(stdout) << "QUIT_TIMEOUT hidden=" << !window.isVisible() << Qt::endl;
+            app.exit(42);
+        });
+        window.show();
+        const int result = app.exec();
+        QTextStream(stdout) << "CONFIRMATIONS=" << confirmations << Qt::endl;
+        if (!saveCompleted) return 15;
+        return result;
+    }
 private slots:
+    void quitExitsWithBackgroundJobs_data() {
+        QTest::addColumn<bool>("cancelFirst");
+        QTest::addColumn<bool>("pendingSave");
+        QTest::newRow("confirmed") << false << false;
+        QTest::newRow("cancel-then-confirm") << true << false;
+        QTest::newRow("wait-for-save") << false << true;
+    }
+    void quitExitsWithBackgroundJobs() {
+        QFETCH(bool, cancelFirst);
+        QFETCH(bool, pendingSave);
+        QTemporaryDir config;
+        QVERIFY(config.isValid());
+        QProcess child;
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        auto env = QProcessEnvironment::systemEnvironment();
+        env.insert("XDG_CONFIG_HOME", config.path());
+        child.setProcessEnvironment(env);
+        child.start(QCoreApplication::applicationFilePath(),
+            {"--quit-probe", cancelFirst ? "cancel" : "confirm", pendingSave ? "saving" : "saved"});
+        QVERIFY(child.waitForStarted());
+        QVERIFY(child.waitForFinished(10000));
+        const auto output = child.readAll();
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(child.exitCode() == 0, output.constData());
+        QVERIFY2(output.contains(cancelFirst ? "CONFIRMATIONS=2" : "CONFIRMATIONS=1"), output.constData());
+        if (cancelFirst) QVERIFY2(output.contains("CANCEL_PRESERVED"), output.constData());
+#ifdef Q_OS_LINUX
+        for (const auto &prefix : {QByteArray("HOST_PID="), QByteArray("SHELL_PID=")}) {
+            const int start = output.indexOf(prefix);
+            QVERIFY2(start >= 0, output.constData());
+            const auto pid = output.mid(start + prefix.size()).split('\n').first().trimmed();
+            QVERIFY(pid.toLongLong() > 0);
+            QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists("/proc/" + QString::fromLatin1(pid)), 2000);
+        }
+#endif
+    }
     void gitStaysInsideWorkspaceWithSessions() {
         QTemporaryDir directory;
         MainWindow window(directory.path());
@@ -424,5 +532,11 @@ private slots:
         QCOMPARE(pinConnected.count(), 0);
     }
 };
-QTEST_MAIN(CoreTest)
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    if (argc == 4 && QByteArray(argv[1]) == "--quit-probe")
+        return CoreTest::runQuitProbe(app, QByteArray(argv[2]) == "cancel", QByteArray(argv[3]) == "saving");
+    CoreTest tests;
+    return QTest::qExec(&tests, argc, argv);
+}
 #include "core_test.moc"
