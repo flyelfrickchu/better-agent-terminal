@@ -8,6 +8,8 @@
     "qt:build": "node scripts/build-qt.mjs",
     "qt:start": "qt-ui/build/better-agent-terminal-qt --server src-tauri/target/qt/debug/bat-server",
     "qt:test": "ctest --test-dir qt-ui/build --output-on-failure --timeout 30",
+    "qt:package:appimage": "node scripts/package-qt-appimage.mjs",
+    "test:qt-version": "node --test tests/qt-version.test.mjs tests/qt-appimage-version.test.mjs",
     "dev": "pnpm run tauri:dev:local",
     "compile": "vite build",
     "start": "pnpm run tauri:dev",

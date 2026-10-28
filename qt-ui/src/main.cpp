@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "terminalpanel.h"
+#include "bat-qt-version.h"
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
@@ -16,7 +17,7 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("better-agent-terminal-qt");
     QApplication::setOrganizationName("BetterAgentTerminal");
-    QApplication::setApplicationVersion("0.1.0-dev");
+    QApplication::setApplicationVersion(BAT_QT_VERSION "-dev");
     QCommandLineParser parser;
     parser.setApplicationDescription("Native Qt UI with KDE Konsole and the BAT Rust host");
     parser.addHelpOption(); parser.addVersionOption();

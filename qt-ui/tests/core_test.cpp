@@ -18,6 +18,8 @@
 #include <QLineEdit>
 #include <QSpinBox>
 #include <QPushButton>
+#include <QToolButton>
+#include <QInputDialog>
 #include <KParts/ReadOnlyPart>
 #include <kde_terminal_interface.h>
 #include <QFile>
@@ -252,6 +254,98 @@ private slots:
         QCOMPARE(updated["qtUi"].toObject()["theme"].toString(), QString("light"));
         QVERIFY(!dialog.findChild<QPushButton *>("saveSettings")->isEnabled());
     }
+    void legacyWorkspacesAppearUnderDefaultProject() {
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        const QJsonObject workspace{{"id", "w1"}, {"name", "Existing"}, {"folderPath", directory.path()}};
+        window.applySnapshot({{"workspaces", QJsonArray{workspace}}});
+        auto *tree = window.findChild<QTreeWidget *>("workspace-projects");
+        QVERIFY2(tree, "Workspaces must display a Project / Workspace tree");
+        QCOMPARE(tree->topLevelItemCount(), 1);
+        QCOMPARE(tree->topLevelItem(0)->text(1), QString("Project_00"));
+        QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QString("Existing"));
+        QCOMPARE(window.m_snapshot["workspaces"].toArray().first().toObject(), workspace);
+        QVERIFY(!window.m_saveTimer.isActive());
+    }
+    void projectGroupsRestoreMembershipAndEmptyGroups() {
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        const QJsonArray projects{
+            QJsonObject{{"id", "p1"}, {"name", "Frontend"}, {"workspaceIds", QJsonArray{"w2"}}, {"future", 42}},
+            QJsonObject{{"id", "p2"}, {"name", "Backend"}, {"workspaceIds", QJsonArray{"w1"}}},
+            QJsonObject{{"id", "p3"}, {"name", "Empty"}, {"workspaceIds", QJsonArray{}}}};
+        window.applySnapshot({{"workspaces", QJsonArray{
+            QJsonObject{{"id", "w1"}, {"name", "API"}, {"folderPath", directory.path()}},
+            QJsonObject{{"id", "w2"}, {"name", "UI"}, {"folderPath", directory.path()}}}},
+            {"qtUi", QJsonObject{{"projects", projects}, {"activeProjectId", "p3"},
+                {"activeWorkspaceId", "w1"}, {"futureQtField", true}}}});
+        auto *tree = window.findChild<QTreeWidget *>("workspace-projects");
+        QVERIFY(tree);
+        QCOMPARE(tree->topLevelItemCount(), 3);
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QString("UI"));
+        QCOMPARE(tree->topLevelItem(1)->child(0)->text(1), QString("API"));
+        QCOMPARE(tree->topLevelItem(2)->childCount(), 0);
+        QCOMPARE(tree->currentItem(), tree->topLevelItem(2));
+        QCOMPARE(window.m_workspaceId, QString("w1"));
+        tree->setCurrentItem(tree->topLevelItem(0)->child(0));
+        QCOMPARE(window.m_workspaceId, QString("w2"));
+        auto qt = window.m_snapshot["qtUi"].toObject();
+        QVERIFY(qt["futureQtField"].toBool());
+        QCOMPARE(qt["projects"].toArray().first().toObject()["future"].toInt(), 42);
+        window.applySnapshot(window.m_snapshot);
+        QCOMPARE(tree->topLevelItemCount(), 3);
+        QCOMPARE(tree->currentItem()->text(1), QString("UI"));
+    }
+    void projectExpansionAndDefaultNames() {
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        QJsonArray projects;
+        for (int i = 0; i < 100; ++i)
+            projects.append(QJsonObject{{"id", QString::number(i)},
+                {"name", QString("Project_%1").arg(i, 2, 10, QLatin1Char('0'))},
+                {"workspaceIds", i == 0 ? QJsonArray{"w1"} : QJsonArray{}}});
+        window.applySnapshot({{"workspaces", QJsonArray{
+            QJsonObject{{"id", "w1"}, {"name", "One"}, {"folderPath", directory.path()}}}},
+            {"qtUi", QJsonObject{{"projects", projects}, {"future", true}}}});
+        QVERIFY(window.defaultProjectName().isEmpty());
+        projects.removeAt(7);
+        auto snapshot = window.m_snapshot; auto qt = snapshot["qtUi"].toObject();
+        qt["projects"] = projects; snapshot["qtUi"] = qt; window.applySnapshot(snapshot);
+        QCOMPARE(window.defaultProjectName(), QString("Project_07"));
+        auto *tree = window.m_workspaces;
+        auto *group = tree->topLevelItem(0);
+        auto *toggle = qobject_cast<QToolButton *>(tree->itemWidget(group, 0));
+        QVERIFY(toggle);
+        QCOMPARE(toggle->text(), QString::fromUtf8("−"));
+        toggle->click();
+        QVERIFY(!group->isExpanded());
+        QCOMPARE(toggle->text(), QString("+"));
+        const auto collapsed = window.m_snapshot;
+        window.applySnapshot(collapsed);
+        group = tree->topLevelItem(0);
+        QVERIFY(!group->isExpanded());
+        toggle = qobject_cast<QToolButton *>(tree->itemWidget(group, 0));
+        toggle->click();
+        QVERIFY(group->isExpanded());
+        QCOMPARE(toggle->text(), QString::fromUtf8("−"));
+        QVERIFY(window.m_snapshot["qtUi"].toObject()["future"].toBool());
+    }
+    void invalidProjectMembershipDoesNotHideOrDuplicateWorkspaces() {
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        window.applySnapshot({{"workspaces", QJsonArray{
+            QJsonObject{{"id", "w1"}, {"name", "One"}}, QJsonObject{{"id", "w2"}, {"name", "Two"}}}},
+            {"qtUi", QJsonObject{{"projects", QJsonArray{
+                QJsonObject{{"id", "p1"}, {"name", "Custom"}, {"workspaceIds", QJsonArray{"w1", "w1", "deleted"}}},
+                QJsonObject{{"id", "p2"}, {"name", "Other"}, {"workspaceIds", QJsonArray{"w1"}}}}}}}});
+        auto *tree = window.m_workspaces;
+        QCOMPARE(tree->topLevelItemCount(), 3);
+        QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
+        QCOMPARE(tree->topLevelItem(1)->childCount(), 0);
+        QCOMPARE(tree->topLevelItem(2)->childCount(), 1);
+        QCOMPARE(tree->topLevelItem(2)->child(0)->text(1), QString("Two"));
+    }
     void snapshotDoesNotScheduleAnotherSave() {
         QTemporaryDir directory;
         MainWindow window(directory.path());
@@ -412,11 +506,16 @@ private slots:
         QString requestPath;
         QString seenContext;
         QJsonObject savedSettings;
+        QJsonObject savedWorkspace;
+        bool delayWorkspaceSaves = false;
+        bool rejectNextWorkspaceSave = false;
+        int workspaceLoads = 0;
+        QList<QJsonObject> pendingWorkspaceReplies;
         bool rejectSettingsSave = true;
         connect(&server, &QWebSocketServer::newConnection, this, [&] {
-            peer = server.nextPendingConnection(); peer->setParent(&server);
+            auto *connection = server.nextPendingConnection(); connection->setParent(&server); peer = connection;
             requestPath = peer->requestUrl().toString();
-            connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString &text) {
+            connect(connection, &QWebSocket::textMessageReceived, this, [&, connection](const QString &text) {
                 const auto frame = QJsonDocument::fromJson(text.toUtf8()).object();
                 QJsonObject response;
                 if (frame["type"] == "auth") {
@@ -435,6 +534,28 @@ private slots:
                         savedSettings = QJsonDocument::fromJson(frame["params"].toObject()["data"].toString().toUtf8()).object();
                         response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", true}};
                     }
+                } else if (frame["channel"] == "workspace:save") {
+                    if (rejectNextWorkspaceSave) {
+                        rejectNextWorkspaceSave = false;
+                        response = {{"type", "invoke-error"}, {"id", frame["id"]}, {"error", "Save failed"}};
+                        connection->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact)));
+                        return;
+                    }
+                    savedWorkspace = QJsonDocument::fromJson(frame["params"].toObject()["data"].toString().toUtf8()).object();
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", true}};
+                    const QJsonObject echo{{"type", "event"}, {"contextId", frame["contextId"]},
+                        {"channel", "workspace:reload"}, {"params", QJsonObject{{"data", frame["params"].toObject()["data"]}}}};
+                    if (delayWorkspaceSaves) {
+                        pendingWorkspaceReplies.append(QJsonObject{{"echo", echo}, {"reply", response}});
+                        return;
+                    }
+                    connection->sendTextMessage(QString::fromUtf8(QJsonDocument(echo).toJson(QJsonDocument::Compact)));
+                } else if (frame["channel"] == "fs:isDirectory") {
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", true}};
+                } else if (frame["channel"] == "workspace:load") {
+                    ++workspaceLoads;
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]},
+                        {"result", QString::fromUtf8(QJsonDocument(savedWorkspace).toJson(QJsonDocument::Compact))}};
                 } else if (frame["channel"].toString().startsWith("git:")) {
                     const auto channel = frame["channel"].toString();
                     QJsonValue result;
@@ -451,7 +572,7 @@ private slots:
                 } else if (frame["channel"] == "fs:readFile") {
                     response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", QJsonObject{{"content", "new content\n"}}}};
                 } else return; // Exercise timeouts / abandoned callers.
-                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact)));
+                connection->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact)));
             });
         });
         QUrl url(QString("wss://localhost:%1").arg(server.serverPort()));
@@ -484,6 +605,120 @@ private slots:
         QTRY_COMPARE(settingsSaved.count(), 1);
         QCOMPARE(savedSettings["defaultClaudeModel"].toString(), QString("changed"));
         QVERIFY(savedSettings["preserved"].toBool());
+        // Exercise the real dialogs, controls and workspace:save contract.
+        const auto originalPeer = peer;
+        MainWindow window(directory.path());
+        QObject::disconnect(&window.m_host, &HostClient::connected, &window, nullptr);
+        window.m_host.connectTo(url);
+        QTRY_VERIFY(window.m_host.ready());
+        window.m_host.setContextId("context-1");
+        window.m_localProfile = false;
+        window.applySnapshot({{"workspaces", QJsonArray{}}, {"qtUi", QJsonObject{{"futureOption", 42}}}});
+        QString offeredName;
+        const auto answerName = [&](const QString &name, bool accept = true) {
+            QTimer::singleShot(0, &window, [&, name, accept] {
+                auto *dialog = qobject_cast<QInputDialog *>(QApplication::activeModalWidget());
+                if (!dialog) return;
+                offeredName = dialog->textValue();
+                if (accept) { dialog->setTextValue(name); dialog->accept(); }
+                else dialog->reject();
+            });
+        };
+        auto *addProject = window.findChild<QToolButton *>("add-project");
+        QVERIFY(addProject);
+        answerName("Project_00"); addProject->click();
+        QCOMPARE(offeredName, QString("Project_00"));
+        QTRY_COMPARE(window.m_workspaces->topLevelItemCount(), 1);
+        QCOMPARE(savedWorkspace["qtUi"].toObject()["projects"].toArray().size(), 1);
+        answerName({}, false); addProject->click();
+        QCOMPARE(offeredName, QString("Project_01"));
+        QCOMPARE(window.m_workspaces->topLevelItemCount(), 1);
+        answerName(" Backend "); addProject->click();
+        QTRY_COMPARE(window.m_workspaces->topLevelItemCount(), 2);
+        QCOMPARE(window.m_workspaces->topLevelItem(1)->text(1), QString("Backend"));
+        answerName("Services"); window.renameProject();
+        QTRY_COMPARE(window.m_workspaces->topLevelItem(1)->text(1), QString("Services"));
+        answerName("project_00"); addProject->click();
+        QCOMPARE(window.m_workspaces->topLevelItemCount(), 2);
+        QCOMPARE(window.m_snapshot["qtUi"].toObject()["projects"].toArray().size(), 2);
+        auto *addWorkspace = qobject_cast<QToolButton *>(window.m_workspaces->itemWidget(
+            window.m_workspaces->topLevelItem(1), 2));
+        QVERIFY(addWorkspace);
+        answerName(directory.path()); addWorkspace->click();
+        // Switching selection during validation must not change the target project.
+        window.m_workspaces->setCurrentItem(window.m_workspaces->topLevelItem(0));
+        QTRY_COMPARE(window.m_workspaces->topLevelItem(1)->childCount(), 1);
+        QCOMPARE(window.m_workspaces->topLevelItem(0)->childCount(), 0);
+        QCOMPARE(savedWorkspace["qtUi"].toObject()["futureOption"].toInt(), 42);
+        auto *toggle = qobject_cast<QToolButton *>(window.m_workspaces->itemWidget(
+            window.m_workspaces->topLevelItem(1), 0));
+        QVERIFY(toggle); toggle->click();
+        QTRY_VERIFY(savedWorkspace["qtUi"].toObject()["projects"].toArray()[1].toObject()["collapsed"].toBool());
+        MainWindow reopened(directory.path());
+        reopened.applySnapshot(savedWorkspace);
+        QCOMPARE(reopened.m_workspaces->topLevelItemCount(), 2);
+        QCOMPARE(reopened.m_workspaces->topLevelItem(1)->text(1), QString("Services"));
+        QCOMPARE(reopened.m_workspaces->topLevelItem(1)->childCount(), 1);
+        QVERIFY(!reopened.m_workspaces->topLevelItem(1)->isExpanded());
+        const auto releaseWorkspaceReply = [&] {
+            const auto pending = pendingWorkspaceReplies.takeFirst();
+            peer->sendTextMessage(QString::fromUtf8(QJsonDocument(pending["echo"].toObject()).toJson(QJsonDocument::Compact)));
+            peer->sendTextMessage(QString::fromUtf8(QJsonDocument(pending["reply"].toObject()).toJson(QJsonDocument::Compact)));
+        };
+        // A second click less than 250 ms before the reply must survive both
+        // the original save's reload echo and its completion callback.
+        delayWorkspaceSaves = true;
+        auto *firstToggle = qobject_cast<QToolButton *>(window.m_workspaces->itemWidget(
+            window.m_workspaces->topLevelItem(0), 0));
+        QVERIFY(firstToggle); firstToggle->click();
+        QTRY_COMPARE(pendingWorkspaceReplies.size(), 1);
+        toggle = qobject_cast<QToolButton *>(window.m_workspaces->itemWidget(window.m_workspaces->topLevelItem(1), 0));
+        toggle->click();
+        releaseWorkspaceReply();
+        QTRY_COMPARE(pendingWorkspaceReplies.size(), 1);
+        QVERIFY(window.m_workspaces->topLevelItem(1)->isExpanded());
+        delayWorkspaceSaves = false; releaseWorkspaceReply();
+        QTRY_VERIFY(!window.m_saveInFlight);
+        QVERIFY(window.m_workspaces->topLevelItem(1)->isExpanded());
+        QVERIFY(!savedWorkspace["qtUi"].toObject()["projects"].toArray()[1].toObject()["collapsed"].toBool());
+        // A terminal opened while a new workspace is being saved must retain
+        // its process and enter the next proposal, rather than be closed by
+        // the earlier proposal's Qt tab list.
+        delayWorkspaceSaves = true;
+        const QString existingWorkspace = window.m_workspaceId;
+        answerName(directory.path()); window.addWorkspace();
+        QTRY_COMPARE(pendingWorkspaceReplies.size(), 1);
+        window.m_localProfile = true;
+        window.createTab({{"id", "during-workspace-save"}, {"workspaceId", existingWorkspace},
+            {"kind", "terminal"}, {"cwd", directory.path()}});
+        auto *tabs = window.m_workspaceTabs.value(existingWorkspace);
+        QPointer<TerminalPanel> terminal = qobject_cast<TerminalPanel *>(tabs->widget(0));
+        QVERIFY(terminal); QVERIFY(terminal->available());
+        releaseWorkspaceReply();
+        QTRY_COMPARE(pendingWorkspaceReplies.size(), 1);
+        QVERIFY(terminal);
+        QCOMPARE(savedWorkspace["qtUi"].toObject()["tabs"].toArray().size(), 1);
+        window.m_localProfile = false; // Avoid adding default local tabs in this protocol test.
+        delayWorkspaceSaves = false; releaseWorkspaceReply();
+        QTRY_VERIFY(!window.m_saveInFlight);
+        QVERIFY(terminal);
+        QCOMPARE(window.m_workspaceTabs.value(existingWorkspace)->widget(0), terminal.data());
+        QVERIFY(!window.m_saveAgain);
+        window.m_localProfile = true;
+        window.createTab({{"id", "unsaved-after-error"}, {"workspaceId", existingWorkspace},
+            {"kind", "terminal"}, {"cwd", directory.path()}});
+        QPointer<TerminalPanel> unsaved = qobject_cast<TerminalPanel *>(tabs->widget(1));
+        QVERIFY(unsaved); QVERIFY(unsaved->available());
+        rejectNextWorkspaceSave = true;
+        window.saveSnapshot();
+        QTRY_COMPARE(workspaceLoads, 1);
+        QTRY_COMPARE(window.m_snapshot["qtUi"].toObject()["tabs"].toArray().size(), 1);
+        QVERIFY(terminal); QVERIFY(unsaved);
+        QCOMPARE(tabs->count(), 2);
+        unsaved->sendInput("printf survived > failed-save-alive.txt\n");
+        QTRY_VERIFY(QFile::exists(directory.filePath("failed-save-alive.txt")));
+        window.m_host.disconnectFromHost();
+        peer = originalPeer;
         GitPanel gitPanel(&client);
         gitPanel.setWorkspace("/repo/subfolder"); gitPanel.refresh();
         auto *commits = gitPanel.findChild<QListWidget *>("git-commits");

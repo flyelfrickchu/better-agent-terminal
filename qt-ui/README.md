@@ -20,7 +20,54 @@ Rust host automatically, or accepts `BAT_QT_SERVER`. Its private local host
 starts on an available loopback port. Use `--data-dir` or `BAT_QT_DATA_DIR` to
 select its persistent state directory.
 
-Use **Add workspace** to select a folder. Each local workspace starts with
+## Automatic Qt versions and AppImage names
+
+`qt-ui/version.json` records the last successful native build. CMake compares
+the content of Qt/runtime source and build inputs; changed inputs increment the
+version once when the native targets compile successfully. Identical rebuilds,
+documentation edits and test-only changes keep the same version. Failed builds
+do not commit the proposed version. Keep this file with source changes when
+committing so subsequent checkouts continue the sequence.
+
+Patch and minor digits range from 0 to 9: `0.0.9` becomes `0.1.0`, `0.9.9`
+becomes `1.0.0`, and `9.9.9` becomes `10.0.0`. The executable's `--version`
+and AppImage filename use the same compiled version with a `-dev` suffix.
+
+After building, package against an existing prepared Qt/KDE AppDir and an
+existing Qt AppImage (used only for its type-2 loader):
+
+```sh
+pnpm run qt:build
+pnpm run qt:package:appimage
+```
+
+For the isolated SDK build directory used on Ubuntu 24.04:
+
+```sh
+cmake --build dist/qt-build/native -j2
+pnpm run qt:package:appimage --build-dir dist/qt-build/native
+```
+
+The packaging command updates the Qt executable in a separate copy of the
+prepared `release/BetterAgentTerminalQt.AppDir`, retaining its bundled host,
+sidecar and Qt/KDE libraries. Stage those runtimes again when they change.
+Use `--appdir PATH` and `--runtime-from IMAGE` to select other prepared inputs.
+The command verifies the compiled version and current source fingerprint, then
+writes `release/BetterAgentTerminalQt_<version>-dev_amd64.AppImage` and a SHA-256
+file. It refuses stale builds and existing output names. For example, the first
+build after `0.1.0` produces `BetterAgentTerminalQt_0.1.1-dev_amd64.AppImage`.
+
+`pnpm run test:qt-version` checks version carry, source changes and packaging
+consistency without building the full application.
+
+The **+** beside **Workspaces** creates a Project group. Enter a custom name
+or keep the first unused default name from `Project_00` through `Project_99`.
+The **+ / −** on the left of a Project expands or collapses its workspaces;
+the **+** on the right adds a workspace inside that Project. Right-click a
+Project to rename it. Groups, empty Projects, membership, and collapsed state
+are saved with the host profile. Existing workspaces appear in `Project_00`.
+
+Use **Add workspace** to select a folder in the selected Project. Each local workspace starts with
 a Konsole tab; **Konsole** adds another. Closing a workspace or terminal
 asks for confirmation because it terminates its running processes.
 

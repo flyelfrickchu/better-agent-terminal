@@ -7,7 +7,6 @@
 #include <QUrl>
 
 class QComboBox;
-class QListWidget;
 class QStackedWidget;
 class QTabWidget;
 class QTextBrowser;
@@ -35,8 +34,13 @@ private:
     void buildUi();
     void loadProfiles();
     void openProfile(const QString &id);
-    void loadWorkspaces();
-    void applySnapshot(const QJsonObject &snapshot);
+    void loadWorkspaces(bool preserveLocalTabs = false);
+    void applySnapshot(const QJsonObject &snapshot, bool preserveLocalTabs = false);
+    void normalizeProjects();
+    void rebuildWorkspaceTree();
+    QString defaultProjectName() const;
+    void addProject();
+    void renameProject();
     void showWorkspace(const QString &id, bool save = true);
     void addWorkspace();
     void removeWorkspace();
@@ -44,6 +48,7 @@ private:
     void addTab(const QString &preset);
     void createTab(const QJsonObject &descriptor, bool save = true);
     void closeTab(QTabWidget *tabs, int index);
+    void scheduleSnapshotSave();
     void saveSnapshot();
     void refreshFiles();
     void loadDirectory(QTreeWidgetItem *parent, const QString &path);
@@ -66,6 +71,8 @@ private:
     QUrl m_connectionUrl;
     QString m_profileId = "default";
     QString m_workspaceId;
+    QString m_projectId;
+    QString m_workspaceToInitialize;
     QString m_contextBinding;
     bool m_localConnection = true;
     bool m_localProfile = true;
@@ -78,7 +85,7 @@ private:
     QJsonObject m_settings;
     QJsonArray m_profiles;
     QComboBox *m_profilePicker;
-    QListWidget *m_workspaces;
+    QTreeWidget *m_workspaces;
     QStackedWidget *m_pages;
     QTabBar *m_workspaceViews;
     QSplitter *m_workspaceSplitter;

@@ -2,6 +2,8 @@ node_modules/
 dist/
 dist-tauri/
 release/
+qt-ui/build/
+qt-ui/.version.lock
 
 # Tauri Rust target dir + generated bundle output
 src-tauri/target/

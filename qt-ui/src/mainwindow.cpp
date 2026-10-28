@@ -17,6 +17,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QHeaderView>
 #include <QInputDialog>
 #include <QJsonDocument>
 #include <QLabel>
@@ -26,6 +27,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QToolButton>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -37,6 +39,7 @@
 #include <QTreeWidget>
 #include <QUuid>
 #include <QVBoxLayout>
+#include <utility>
 
 namespace {
 QString newId() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
@@ -71,6 +74,9 @@ MainWindow::MainWindow(const QString &dataDirectory, QWidget *parent)
     });
     connect(&m_host, &HostClient::eventReceived, this, [this](const QString &channel, const QJsonObject &params) {
         if (channel == "workspace:reload") {
+            // A successful save is also broadcast as a reload. Let the save
+            // queue commit its reply without replacing newer pending edits.
+            if (m_saveInFlight || m_saveTimer.isActive()) return;
             if (params["data"].isString()) {
                 const auto data = QJsonDocument::fromJson(params["data"].toString().toUtf8());
                 if (data.isObject()) applySnapshot(data.object());
@@ -139,16 +145,80 @@ void MainWindow::buildUi() {
 
     auto *workspaceDock = new QDockWidget(tr("Workspaces"), this);
     workspaceDock->setObjectName("workspaces-dock");
-    m_workspaces = new QListWidget(workspaceDock);
+    auto *workspaceTitle = new QWidget(workspaceDock);
+    auto *titleLayout = new QHBoxLayout(workspaceTitle);
+    titleLayout->setContentsMargins(6, 2, 4, 2);
+    titleLayout->addWidget(new QLabel(tr("Workspaces"), workspaceTitle));
+    titleLayout->addStretch();
+    auto *newProject = new QToolButton(workspaceTitle);
+    newProject->setObjectName("add-project");
+    newProject->setText("+"); newProject->setToolTip(tr("Add project"));
+    newProject->setAccessibleName(tr("Add project"));
+    titleLayout->addWidget(newProject);
+    auto *floatWorkspaces = new QToolButton(workspaceTitle);
+    floatWorkspaces->setIcon(style()->standardIcon(QStyle::SP_TitleBarNormalButton));
+    floatWorkspaces->setToolTip(tr("Float / dock Workspaces"));
+    floatWorkspaces->setAccessibleName(floatWorkspaces->toolTip());
+    titleLayout->addWidget(floatWorkspaces);
+    connect(floatWorkspaces, &QToolButton::clicked, workspaceDock, [workspaceDock] {
+        workspaceDock->setFloating(!workspaceDock->isFloating());
+    });
+    auto *closeWorkspaces = new QToolButton(workspaceTitle);
+    closeWorkspaces->setIcon(style()->standardIcon(QStyle::SP_TitleBarCloseButton));
+    closeWorkspaces->setToolTip(tr("Hide Workspaces"));
+    closeWorkspaces->setAccessibleName(closeWorkspaces->toolTip());
+    titleLayout->addWidget(closeWorkspaces);
+    connect(closeWorkspaces, &QToolButton::clicked, workspaceDock, &QDockWidget::close);
+    workspaceDock->setTitleBarWidget(workspaceTitle);
+    connect(newProject, &QToolButton::clicked, this, &MainWindow::addProject);
+    m_workspaces = new QTreeWidget(workspaceDock);
+    m_workspaces->setObjectName("workspace-projects");
+    m_workspaces->setColumnCount(3); m_workspaces->setHeaderHidden(true);
+    m_workspaces->setRootIsDecorated(false);
+    m_workspaces->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_workspaces->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_workspaces->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_workspaces->header()->setStretchLastSection(false);
+    m_workspaces->setTreePosition(1);
     m_workspaces->setContextMenuPolicy(Qt::CustomContextMenu);
     workspaceDock->setWidget(m_workspaces); addDockWidget(Qt::LeftDockWidgetArea, workspaceDock);
-    connect(m_workspaces, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *item) {
-        if (item) showWorkspace(item->data(Qt::UserRole).toString());
+    connect(m_workspaces, &QTreeWidget::currentItemChanged, this, [this](QTreeWidgetItem *item) {
+        if (!item) return;
+        auto *project = item->parent() ? item->parent() : item;
+        m_projectId = project->data(0, Qt::UserRole).toString();
+        auto qt = m_snapshot["qtUi"].toObject();
+        qt["activeProjectId"] = m_projectId; m_snapshot["qtUi"] = qt;
+        if (item->parent()) showWorkspace(item->data(0, Qt::UserRole).toString());
+        if (!m_loading) scheduleSnapshotSave();
     });
-    connect(m_workspaces, &QListWidget::customContextMenuRequested, this, [this](const QPoint &point) {
-        QMenu menu(this); menu.addAction(tr("Rename"), this, &MainWindow::renameWorkspace);
-        menu.addAction(tr("Remove workspace"), this, &MainWindow::removeWorkspace);
-        menu.exec(m_workspaces->mapToGlobal(point));
+    const auto saveExpansion = [this](QTreeWidgetItem *item) {
+        if (m_loading || item->parent()) return;
+        if (auto *toggle = qobject_cast<QToolButton *>(m_workspaces->itemWidget(item, 0)))
+            toggle->setText(item->isExpanded() ? "−" : "+");
+        auto qt = m_snapshot["qtUi"].toObject(); auto projects = qt["projects"].toArray();
+        for (int i = 0; i < projects.size(); ++i) {
+            auto project = projects[i].toObject();
+            if (project["id"].toString() == item->data(0, Qt::UserRole).toString()) {
+                project["collapsed"] = !item->isExpanded(); projects[i] = project;
+            }
+        }
+        qt["projects"] = projects; m_snapshot["qtUi"] = qt; scheduleSnapshotSave();
+    };
+    connect(m_workspaces, &QTreeWidget::itemExpanded, this, saveExpansion);
+    connect(m_workspaces, &QTreeWidget::itemCollapsed, this, saveExpansion);
+    connect(m_workspaces, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &point) {
+        auto *item = m_workspaces->itemAt(point);
+        if (item) m_workspaces->setCurrentItem(item);
+        QMenu menu(this);
+        if (item && item->parent()) {
+            menu.addAction(tr("Rename workspace"), this, &MainWindow::renameWorkspace);
+            menu.addAction(tr("Remove workspace"), this, &MainWindow::removeWorkspace);
+        } else if (item) {
+            menu.addAction(tr("Add workspace"), this, &MainWindow::addWorkspace);
+            menu.addAction(tr("Rename project"), this, &MainWindow::renameProject);
+        }
+        menu.addAction(tr("Add project"), this, &MainWindow::addProject);
+        menu.exec(m_workspaces->viewport()->mapToGlobal(point));
     });
     auto *fileDock = new QDockWidget(tr("Files"), this); fileDock->setObjectName("files-dock");
     m_files = new QTreeWidget(fileDock); m_files->setHeaderHidden(true);
@@ -202,6 +272,7 @@ void MainWindow::buildUi() {
     previewDock->setWidget(m_preview); addDockWidget(Qt::RightDockWidgetArea, previewDock); previewDock->hide();
 
     auto *fileMenu = menuBar()->addMenu(tr("File"));
+    fileMenu->addAction(tr("Add project"), this, &MainWindow::addProject);
     auto *newWorkspace = fileMenu->addAction(tr("Add workspace"), this, &MainWindow::addWorkspace);
     newWorkspace->setShortcut(QKeySequence("Ctrl+Shift+O"));
     auto *newTerminal = fileMenu->addAction(tr("New Konsole terminal"), this, [this] { addTab("none"); });
@@ -292,39 +363,179 @@ void MainWindow::openProfile(const QString &id) {
         }, 30000, false);
 }
 
-void MainWindow::loadWorkspaces() {
+void MainWindow::loadWorkspaces(bool preserveLocalTabs) {
     if (!m_host.ready() || m_host.contextId().isEmpty() || m_saveInFlight) return;
     m_host.invoke("workspace:load", {{"profileId", m_profileId}}, this,
-        [this](const QJsonValue &value, const QString &error) {
+        [this, preserveLocalTabs](const QJsonValue &value, const QString &error) {
             if (!error.isEmpty()) { report(error); return; }
-            if (value.isNull() || value.isUndefined()) applySnapshot(QJsonObject{{"workspaces", QJsonArray{}}, {"terminals", QJsonArray{}}});
+            if (value.isNull() || value.isUndefined()) applySnapshot(QJsonObject{{"workspaces", QJsonArray{}}, {"terminals", QJsonArray{}}}, preserveLocalTabs);
             else {
                 QJsonParseError parseError;
                 const auto document = QJsonDocument::fromJson(value.toString().toUtf8(), &parseError);
                 if (!document.isObject() || parseError.error != QJsonParseError::NoError) {
                     report(tr("Workspace data is invalid; it has not been overwritten.")); return;
                 }
-                applySnapshot(document.object());
+                applySnapshot(document.object(), preserveLocalTabs);
             }
             emit workspaceReady();
         });
 }
 
-void MainWindow::applySnapshot(const QJsonObject &snapshot) {
+QString MainWindow::defaultProjectName() const {
+    QSet<QString> names;
+    for (const auto &entry : m_snapshot["qtUi"].toObject()["projects"].toArray())
+        names.insert(entry.toObject()["name"].toString().toCaseFolded());
+    for (int i = 0; i < 100; ++i) {
+        const auto name = QString("Project_%1").arg(i, 2, 10, QLatin1Char('0'));
+        if (!names.contains(name.toCaseFolded())) return name;
+    }
+    return {};
+}
+
+void MainWindow::normalizeProjects() {
+    auto qt = m_snapshot["qtUi"].toObject();
+    QSet<QString> workspaceIds, assigned, projectIds;
+    for (const auto &entry : m_snapshot["workspaces"].toArray())
+        workspaceIds.insert(entry.toObject()["id"].toString());
+    QJsonArray projects;
+    for (const auto &entry : qt["projects"].toArray()) {
+        auto project = entry.toObject();
+        const QString id = project["id"].toString();
+        if (id.isEmpty() || projectIds.contains(id)) continue;
+        projectIds.insert(id);
+        QJsonArray members;
+        for (const auto &member : project["workspaceIds"].toArray()) {
+            const QString workspaceId = member.toString();
+            if (!workspaceIds.contains(workspaceId) || assigned.contains(workspaceId)) continue;
+            assigned.insert(workspaceId); members.append(workspaceId);
+        }
+        project["workspaceIds"] = members; projects.append(project);
+    }
+    QJsonArray ungrouped;
+    for (const auto &entry : m_snapshot["workspaces"].toArray()) {
+        const QString id = entry.toObject()["id"].toString();
+        if (!assigned.contains(id)) { ungrouped.append(id); assigned.insert(id); }
+    }
+    if (!ungrouped.isEmpty()) {
+        int fallback = -1;
+        for (int i = 0; i < projects.size(); ++i)
+            if (projects[i].toObject()["id"] == "default-project") fallback = i;
+        if (fallback < 0 && !projects.isEmpty() && defaultProjectName().isEmpty()) fallback = 0;
+        if (fallback < 0) {
+            qt["projects"] = projects; m_snapshot["qtUi"] = qt;
+            projects.append(QJsonObject{{"id", "default-project"}, {"name", defaultProjectName()},
+                {"workspaceIds", ungrouped}});
+        } else {
+            auto project = projects[fallback].toObject(); auto members = project["workspaceIds"].toArray();
+            for (const auto &member : ungrouped) members.append(member);
+            project["workspaceIds"] = members; projects[fallback] = project;
+        }
+    }
+    qt["projects"] = projects; m_snapshot["qtUi"] = qt;
+}
+
+void MainWindow::rebuildWorkspaceTree() {
+    const QSignalBlocker blocker(m_workspaces);
+    m_workspaces->clear();
+    const auto projects = m_snapshot["qtUi"].toObject()["projects"].toArray();
+    QHash<QString, QJsonObject> workspaces;
+    for (const auto &entry : m_snapshot["workspaces"].toArray()) {
+        const auto workspace = entry.toObject(); workspaces.insert(workspace["id"].toString(), workspace);
+    }
+    bool selectedProjectExists = false;
+    for (const auto &entry : projects)
+        if (entry.toObject()["id"] == m_projectId) selectedProjectExists = true;
+    if (!selectedProjectExists) {
+        m_projectId.clear();
+        for (const auto &entry : projects) {
+            const auto project = entry.toObject();
+            if (project["workspaceIds"].toArray().contains(m_workspaceId)) m_projectId = project["id"].toString();
+        }
+        if (m_projectId.isEmpty() && !projects.isEmpty()) m_projectId = projects.first().toObject()["id"].toString();
+    }
+    for (const auto &entry : projects) {
+        const auto project = entry.toObject(); const QString id = project["id"].toString();
+        auto *group = new QTreeWidgetItem(m_workspaces);
+        group->setData(0, Qt::UserRole, id); group->setText(1, project["name"].toString());
+        group->setIcon(1, QIcon::fromTheme("folder"));
+        auto font = group->font(1); font.setBold(true); group->setFont(1, font);
+        const bool expanded = !project["collapsed"].toBool();
+        auto *toggle = new QToolButton(m_workspaces);
+        toggle->setText(expanded ? "−" : "+");
+        toggle->setAccessibleName(tr("Expand or collapse %1").arg(project["name"].toString()));
+        toggle->setToolTip(tr("Expand / collapse project")); toggle->setAutoRaise(true);
+        m_workspaces->setItemWidget(group, 0, toggle);
+        connect(toggle, &QToolButton::clicked, this, [group] { group->setExpanded(!group->isExpanded()); });
+        auto *add = new QToolButton(m_workspaces);
+        add->setText("+"); add->setToolTip(tr("Add workspace to %1").arg(project["name"].toString()));
+        add->setAccessibleName(add->toolTip()); add->setAutoRaise(true);
+        m_workspaces->setItemWidget(group, 2, add);
+        connect(add, &QToolButton::clicked, this, [this, group] {
+            m_workspaces->setCurrentItem(group); addWorkspace();
+        });
+        if (id == m_projectId) m_workspaces->setCurrentItem(group);
+        for (const auto &member : project["workspaceIds"].toArray()) {
+            const QString workspaceId = member.toString(); const auto workspace = workspaces.value(workspaceId);
+            auto *item = new QTreeWidgetItem(group);
+            item->setText(1, workspace["alias"].toString(workspace["name"].toString()));
+            item->setData(0, Qt::UserRole, workspaceId);
+            item->setToolTip(1, workspace["folderPath"].toString());
+            item->setIcon(1, QIcon::fromTheme("utilities-terminal"));
+            if (id == m_projectId && workspaceId == m_workspaceId) m_workspaces->setCurrentItem(item);
+        }
+        group->setExpanded(expanded);
+    }
+}
+
+void MainWindow::addProject() {
+    if (!hostReady()) { report(tr("Connect to a host first.")); return; }
+    if (m_loading || m_saveInFlight) { report(tr("Wait for the current workspace save.")); return; }
+    bool accepted = false;
+    const QString name = QInputDialog::getText(this, tr("Add project"), tr("Project name:"),
+        QLineEdit::Normal, defaultProjectName(), &accepted).trimmed();
+    if (!accepted || name.isEmpty()) return;
+    auto qt = m_snapshot["qtUi"].toObject(); auto projects = qt["projects"].toArray();
+    for (const auto &entry : projects) if (entry.toObject()["name"].toString().compare(name, Qt::CaseInsensitive) == 0) {
+        report(tr("A project with that name already exists.")); return;
+    }
+    m_projectId = newId();
+    projects.append(QJsonObject{{"id", m_projectId}, {"name", name}, {"workspaceIds", QJsonArray{}}});
+    qt["projects"] = projects; qt["activeProjectId"] = m_projectId;
+    m_snapshot["qtUi"] = qt; saveSnapshot();
+}
+
+void MainWindow::renameProject() {
+    if (!hostReady() || m_loading || m_saveInFlight) return;
+    auto qt = m_snapshot["qtUi"].toObject(); auto projects = qt["projects"].toArray();
+    const QString id = m_projectId;
+    int index = -1;
+    for (int i = 0; i < projects.size(); ++i) if (projects[i].toObject()["id"] == id) index = i;
+    if (index < 0) return;
+    bool accepted = false;
+    const QString name = QInputDialog::getText(this, tr("Rename project"), tr("Project name:"),
+        QLineEdit::Normal, projects[index].toObject()["name"].toString(), &accepted).trimmed();
+    if (!accepted || name.isEmpty()) return;
+    for (int i = 0; i < projects.size(); ++i)
+        if (i != index && projects[i].toObject()["name"].toString().compare(name, Qt::CaseInsensitive) == 0) {
+            report(tr("A project with that name already exists.")); return;
+        }
+    auto project = projects[index].toObject(); project["name"] = name; projects[index] = project;
+    qt["projects"] = projects; m_snapshot["qtUi"] = qt; saveSnapshot();
+}
+
+void MainWindow::applySnapshot(const QJsonObject &snapshot, bool preserveLocalTabs) {
     m_loading = true;
     m_snapshot = snapshot;
-    const QSignalBlocker blocker(m_workspaces); m_workspaces->clear();
+    normalizeProjects();
     QSet<QString> ids;
     for (const auto &entry : snapshot["workspaces"].toArray()) {
         const auto workspace = entry.toObject(); const QString id = workspace["id"].toString();
         ids.insert(id);
-        auto *item = new QListWidgetItem(workspace["alias"].toString(workspace["name"].toString()), m_workspaces);
-        item->setData(Qt::UserRole, id); item->setToolTip(workspace["folderPath"].toString());
         if (!m_workspaceTabs.contains(id)) {
             auto *tabs = new QTabWidget(m_pages); tabs->setTabsClosable(true); tabs->setMovable(true);
             tabs->setDocumentMode(true); m_pages->addWidget(tabs); m_workspaceTabs[id] = tabs;
             connect(tabs, &QTabWidget::tabCloseRequested, this, [this, tabs](int index) { closeTab(tabs, index); });
-            connect(tabs, &QTabWidget::currentChanged, this, [this] { if (!m_loading) m_saveTimer.start(); });
+            connect(tabs, &QTabWidget::currentChanged, this, [this] { if (!m_loading) scheduleSnapshotSave(); });
         }
     }
     for (const auto &id : m_workspaceTabs.keys()) if (!ids.contains(id)) {
@@ -338,7 +549,8 @@ void MainWindow::applySnapshot(const QJsonObject &snapshot) {
     for (const auto &entry : savedTabs) savedIds.insert(entry.toObject()["id"].toString());
     // Legacy clients and snapshots do not carry Qt tabs. Only an explicit
     // Qt tab list can remove local sessions; absence is not an empty list.
-    if (qt["tabs"].isArray()) for (auto *tabs : std::as_const(m_workspaceTabs)) {
+    // Rolling back a rejected save must not terminate unsaved local shells.
+    if (qt["tabs"].isArray() && !preserveLocalTabs) for (auto *tabs : std::as_const(m_workspaceTabs)) {
         for (int i = tabs->count() - 1; i >= 0; --i) {
             auto *widget = tabs->widget(i);
             if (!savedIds.contains(widget->property("tabId").toString())) {
@@ -351,23 +563,27 @@ void MainWindow::applySnapshot(const QJsonObject &snapshot) {
         if (auto *agent = qobject_cast<AgentPanel *>(tabs->widget(i))) agent->attach();
     }
     QString selected = qt["activeWorkspaceId"].toString(snapshot["activeWorkspaceId"].toString());
-    if (!ids.contains(selected) && m_workspaces->count()) selected = m_workspaces->item(0)->data(Qt::UserRole).toString();
-    for (int i = 0; i < m_workspaces->count(); ++i)
-        if (m_workspaces->item(i)->data(Qt::UserRole).toString() == selected) m_workspaces->setCurrentRow(i);
-    m_loading = false;
+    const auto workspaces = snapshot["workspaces"].toArray();
+    if (!ids.contains(selected)) selected = workspaces.isEmpty() ? QString() : workspaces.first().toObject()["id"].toString();
+    m_projectId = m_snapshot["qtUi"].toObject()["activeProjectId"].toString();
     showWorkspace(selected, false);
+    rebuildWorkspaceTree();
+    m_loading = false;
     report(tr("Ready · %1 · Konsole is the default terminal").arg(m_profilePicker->currentText()));
 }
 
 void MainWindow::showWorkspace(const QString &id, bool save) {
     const bool changed = m_workspaceId != id;
     m_workspaceId = id;
+    if (save) {
+        auto qt = m_snapshot["qtUi"].toObject(); qt["activeWorkspaceId"] = id; m_snapshot["qtUi"] = qt;
+    }
     if (auto *tabs = m_workspaceTabs.value(id)) m_pages->setCurrentWidget(tabs);
     else m_pages->setCurrentIndex(0);
     setWindowTitle(tr("%1 — Better Agent Terminal Qt").arg(activeWorkspace()["name"].toString("Workspaces")));
     m_gitPanel->setWorkspace(currentDirectory());
     if (m_filesContext != m_host.contextId() || m_filesDirectory != currentDirectory()) refreshFiles();
-    if (save && changed && !m_loading) m_saveTimer.start();
+    if (save && changed && !m_loading) scheduleSnapshotSave();
 }
 QJsonObject MainWindow::activeWorkspace() const {
     for (const auto &entry : m_snapshot["workspaces"].toArray()) if (entry.toObject()["id"] == m_workspaceId) return entry.toObject();
@@ -377,31 +593,47 @@ QString MainWindow::currentDirectory() const { return activeWorkspace()["folderP
 
 void MainWindow::addWorkspace() {
     if (!hostReady()) { report(tr("Connect to a host first.")); return; }
+    if (m_loading || m_saveInFlight) { report(tr("Wait for the current workspace save.")); return; }
+    const QString projectId = m_projectId;
+    const QString context = m_host.contextId();
     QString directory;
     if (m_localProfile) directory = QFileDialog::getExistingDirectory(this, tr("Workspace folder"), QDir::homePath());
     else directory = QInputDialog::getText(this, tr("Remote workspace"), tr("Folder path on the host:"));
     if (directory.isEmpty()) return;
     m_host.invoke("fs:isDirectory", {{"path", directory}}, this,
-        [this, directory](const QJsonValue &value, const QString &error) {
+        [this, directory, projectId, context](const QJsonValue &value, const QString &error) {
+            if (context != m_host.contextId()) return;
             if (!error.isEmpty()) { report(error); return; }
             if (!value.toBool()) { report(tr("The host cannot find that directory.")); return; }
+            if (m_saveInFlight) { report(tr("Wait for the current workspace save.")); return; }
             const QString id = newId();
             auto workspaces = m_snapshot["workspaces"].toArray();
             workspaces.append(QJsonObject{{"id", id}, {"name", QFileInfo(directory).fileName()},
                 {"folderPath", directory}, {"createdAt", QDateTime::currentMSecsSinceEpoch()}});
             m_snapshot["workspaces"] = workspaces;
-            auto qt = m_snapshot["qtUi"].toObject(); qt["activeWorkspaceId"] = id; m_snapshot["qtUi"] = qt;
-            const auto changed = m_snapshot;
-            m_host.invoke("workspace:save", {{"profileId", m_profileId}, {"data", QString::fromUtf8(QJsonDocument(changed).toJson(QJsonDocument::Compact))}}, this,
-                [this, changed](const QJsonValue &, const QString &saveError) {
-                    if (!saveError.isEmpty()) { report(saveError); loadWorkspaces(); return; }
-                    applySnapshot(changed);
-                    if (m_localProfile) {
-                        const int count = qBound(1, m_settings["defaultTerminalCount"].toInt(1), 10);
-                        for (int i = 0; i < count; ++i) addTab("none");
-                    }
-                    if (m_settings["createDefaultAgentTerminal"].toBool()) addTab(m_settings["defaultAgent"].toString("claude-code"));
-                });
+            auto qt = m_snapshot["qtUi"].toObject(); auto projects = qt["projects"].toArray();
+            QString targetProject;
+            for (int i = 0; i < projects.size(); ++i) {
+                auto project = projects[i].toObject();
+                if (project["id"] != projectId) continue;
+                auto members = project["workspaceIds"].toArray(); members.append(id);
+                project["workspaceIds"] = members; project["collapsed"] = false; projects[i] = project;
+                targetProject = projectId;
+            }
+            if (targetProject.isEmpty() && !projects.isEmpty()) {
+                auto project = projects[0].toObject();
+                targetProject = project["id"].toString();
+                auto members = project["workspaceIds"].toArray(); members.append(id);
+                project["workspaceIds"] = members; project["collapsed"] = false; projects[0] = project;
+            }
+            if (targetProject.isEmpty()) {
+                targetProject = newId();
+                projects.append(QJsonObject{{"id", targetProject}, {"name", defaultProjectName()}, {"workspaceIds", QJsonArray{id}}});
+            }
+            qt["projects"] = projects; qt["activeProjectId"] = targetProject;
+            qt["activeWorkspaceId"] = id; m_snapshot["qtUi"] = qt;
+            m_workspaceToInitialize = id;
+            saveSnapshot();
         });
 }
 void MainWindow::renameWorkspace() {
@@ -470,7 +702,7 @@ void MainWindow::createTab(const QJsonObject &descriptor, bool save) {
             if (m_closing) return;
             if (m_settings["closeTerminalAfterProcessExit"].toBool()) {
                 const int index = tabs->indexOf(terminal);
-                if (index >= 0) { tabs->removeTab(index); terminal->deleteLater(); if (!m_loading) m_saveTimer.start(); }
+                if (index >= 0) { tabs->removeTab(index); terminal->deleteLater(); if (!m_loading) scheduleSnapshotSave(); }
                 return;
             }
             const int index = tabs->indexOf(terminal); if (index >= 0) tabs->setTabText(index, QObject::tr("Exited"));
@@ -478,7 +710,7 @@ void MainWindow::createTab(const QJsonObject &descriptor, bool save) {
         panel = terminal;
     } else {
         auto *agent = new AgentPanel(&m_host, descriptor, tabs); panel = agent;
-        connect(agent, &AgentPanel::descriptorChanged, this, [this] { if (!m_loading) m_saveTimer.start(); });
+        connect(agent, &AgentPanel::descriptorChanged, this, [this] { if (!m_loading) scheduleSnapshotSave(); });
         connect(agent, &AgentPanel::attentionRequired, this, [this](const QString &title) {
             QApplication::alert(this); report(title);
         });
@@ -487,7 +719,7 @@ void MainWindow::createTab(const QJsonObject &descriptor, bool save) {
     panel->setProperty("tabId", id); panel->setProperty("descriptor", descriptor.toVariantMap());
     const int index = tabs->addTab(panel, descriptor["title"].toString());
     tabs->setTabToolTip(index, descriptor["cwd"].toString());
-    if (save) { tabs->setCurrentIndex(index); m_saveTimer.start(); }
+    if (save) { tabs->setCurrentIndex(index); scheduleSnapshotSave(); }
 }
 
 void MainWindow::closeTab(QTabWidget *tabs, int index) {
@@ -496,12 +728,20 @@ void MainWindow::closeTab(QTabWidget *tabs, int index) {
     if ((!agent || agent->busy()) && QMessageBox::question(this, tr("Close tab"),
         tr("Close this tab and stop its session?")) != QMessageBox::Yes) return;
     if (agent) agent->stopSession();
-    tabs->removeTab(index); delete panel; m_saveTimer.start();
+    tabs->removeTab(index); delete panel; scheduleSnapshotSave();
+}
+
+void MainWindow::scheduleSnapshotSave() {
+    if (m_loading) return;
+    // Mark edits immediately; the reply can arrive before the debounce fires.
+    if (m_saveInFlight) m_saveAgain = true;
+    m_saveTimer.start();
 }
 
 void MainWindow::saveSnapshot() {
     if (!hostReady() || m_loading) return;
     if (m_saveInFlight) { m_saveAgain = true; return; }
+    m_saveTimer.stop(); m_saveAgain = false;
     m_saveInFlight = true;
     QJsonArray descriptors;
     for (auto *tabs : std::as_const(m_workspaceTabs)) for (int i = 0; i < tabs->count(); ++i) {
@@ -510,16 +750,30 @@ void MainWindow::saveSnapshot() {
         if (auto *agent = qobject_cast<AgentPanel *>(panel)) descriptor = agent->descriptor();
         descriptors.append(descriptor);
     }
-    auto qt = m_snapshot["qtUi"].toObject(); qt["tabs"] = descriptors; qt["activeWorkspaceId"] = m_workspaceId;
+    auto qt = m_snapshot["qtUi"].toObject(); qt["tabs"] = descriptors;
+    qt["activeWorkspaceId"] = m_workspaceToInitialize.isEmpty() ? m_workspaceId : m_workspaceToInitialize;
     m_snapshot["qtUi"] = qt;
     const QJsonObject proposed = m_snapshot;
     const QString data = QString::fromUtf8(QJsonDocument(proposed).toJson(QJsonDocument::Compact));
     m_host.invoke("workspace:save", {{"profileId", m_profileId}, {"data", data}}, this,
         [this, proposed](const QJsonValue &, const QString &error) {
             m_saveInFlight = false;
-            if (!error.isEmpty()) { report(error); return; }
+            if (!error.isEmpty()) {
+                m_saveAgain = false; m_saveTimer.stop(); m_workspaceToInitialize.clear();
+                report(error); loadWorkspaces(true); return;
+            }
             if (m_saveAgain) { m_saveAgain = false; saveSnapshot(); }
-            else applySnapshot(proposed);
+            else {
+                applySnapshot(proposed);
+                const QString created = std::exchange(m_workspaceToInitialize, {});
+                if (!created.isEmpty() && m_workspaceId == created) {
+                    if (m_localProfile) {
+                        const int count = qBound(1, m_settings["defaultTerminalCount"].toInt(1), 10);
+                        for (int i = 0; i < count; ++i) addTab("none");
+                    }
+                    if (m_settings["createDefaultAgentTerminal"].toBool()) addTab(m_settings["defaultAgent"].toString("claude-code"));
+                }
+            }
         });
 }
 
@@ -682,7 +936,7 @@ void MainWindow::clearPages() {
     m_workspaceTabs.clear(); m_workspaces->clear(); m_files->clear();
     m_gitPanel->setWorkspace({});
     m_filesContext.clear(); m_filesDirectory.clear(); ++m_filesGeneration;
-    m_workspaceId.clear(); m_snapshot = {}; m_loading = false;
+    m_workspaceId.clear(); m_projectId.clear(); m_workspaceToInitialize.clear(); m_snapshot = {}; m_loading = false;
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
     const bool hasTerminals = !findChildren<TerminalPanel *>().isEmpty();
