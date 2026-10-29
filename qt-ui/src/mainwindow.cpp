@@ -216,6 +216,7 @@ void MainWindow::buildUi() {
         } else if (item) {
             menu.addAction(tr("Add workspace"), this, &MainWindow::addWorkspace);
             menu.addAction(tr("Rename project"), this, &MainWindow::renameProject);
+            menu.addAction(tr("Remove project"), this, &MainWindow::removeProject);
         }
         menu.addAction(tr("Add project"), this, &MainWindow::addProject);
         menu.exec(m_workspaces->viewport()->mapToGlobal(point));
@@ -521,6 +522,56 @@ void MainWindow::renameProject() {
         }
     auto project = projects[index].toObject(); project["name"] = name; projects[index] = project;
     qt["projects"] = projects; m_snapshot["qtUi"] = qt; saveSnapshot();
+}
+
+void MainWindow::removeProject() {
+    if (!hostReady() || m_loading || m_saveInFlight) return;
+    const QString id = m_projectId;
+    const QString context = m_host.contextId();
+    QJsonObject selected;
+    for (const auto &entry : m_snapshot["qtUi"].toObject()["projects"].toArray())
+        if (entry.toObject()["id"] == id) selected = entry.toObject();
+    if (selected.isEmpty()) return;
+    QMessageBox confirmation(QMessageBox::Question, tr("Remove project"),
+        tr("Remove project \"%1\" and its %2 workspace(s)? Their Qt tabs will close and agent sessions will stop. Files will remain on disk.")
+            .arg(selected["name"].toString()).arg(selected["workspaceIds"].toArray().size()),
+        QMessageBox::Yes | QMessageBox::No, this);
+    confirmation.setTextFormat(Qt::PlainText);
+    confirmation.setDefaultButton(QMessageBox::No);
+    if (confirmation.exec() != QMessageBox::Yes) return;
+    // The modal dialog processes host events. Re-read current state and never
+    // apply a confirmation to another profile or an in-flight save.
+    if (!hostReady() || m_host.contextId() != context || m_loading || m_saveInFlight) return;
+    auto qt = m_snapshot["qtUi"].toObject(); auto projects = qt["projects"].toArray();
+    int index = -1;
+    for (int i = 0; i < projects.size(); ++i)
+        if (projects[i].toObject()["id"] == id) index = i;
+    if (index < 0) return;
+    QSet<QString> removed;
+    for (const auto &member : projects[index].toObject()["workspaceIds"].toArray()) removed.insert(member.toString());
+    projects.removeAt(index);
+    auto workspaces = m_snapshot["workspaces"].toArray();
+    for (int i = workspaces.size() - 1; i >= 0; --i)
+        if (removed.contains(workspaces[i].toObject()["id"].toString())) workspaces.removeAt(i);
+    for (const auto &workspaceId : removed) {
+        auto *tabs = m_workspaceTabs.take(workspaceId);
+        if (!tabs) continue;
+        for (int i = 0; i < tabs->count(); ++i)
+            if (auto *agent = qobject_cast<AgentPanel *>(tabs->widget(i))) agent->stopSession();
+        m_pages->removeWidget(tabs); delete tabs;
+    }
+    if (removed.contains(m_workspaceToInitialize)) m_workspaceToInitialize.clear();
+    if (removed.contains(m_workspaceId))
+        m_workspaceId = workspaces.isEmpty() ? QString() : workspaces.first().toObject()["id"].toString();
+    m_projectId = projects.isEmpty() ? QString() : projects.first().toObject()["id"].toString();
+    for (const auto &entry : projects)
+        if (entry.toObject()["workspaceIds"].toArray().contains(m_workspaceId)) m_projectId = entry.toObject()["id"].toString();
+    qt["projects"] = projects; qt["activeProjectId"] = m_projectId;
+    m_snapshot["qtUi"] = qt; m_snapshot["workspaces"] = workspaces;
+    if (removed.contains(m_snapshot["activeWorkspaceId"].toString())) m_snapshot["activeWorkspaceId"] = m_workspaceId;
+    showWorkspace(m_workspaceId, false);
+    rebuildWorkspaceTree();
+    saveSnapshot();
 }
 
 void MainWindow::applySnapshot(const QJsonObject &snapshot, bool preserveLocalTabs) {

@@ -64,7 +64,10 @@ The **+** beside **Workspaces** creates a Project group. Enter a custom name
 or keep the first unused default name from `Project_00` through `Project_99`.
 The **+ / −** on the left of a Project expands or collapses its workspaces;
 the **+** on the right adds a workspace inside that Project. Right-click a
-Project to rename it. Groups, empty Projects, membership, and collapsed state
+Project to rename it or choose **Remove project**. Removal asks for confirmation,
+then removes the Project and all its workspaces, closes their Qt tabs, and stops
+their agent sessions. Files on disk remain. Empty Projects can also be removed.
+Groups, empty Projects, membership, and collapsed state
 are saved with the host profile. Existing workspaces appear in `Project_00`.
 
 Use **Add workspace** to select a folder in the selected Project. Each local workspace starts with

@@ -41,6 +41,7 @@ private:
     QString defaultProjectName() const;
     void addProject();
     void renameProject();
+    void removeProject();
     void showWorkspace(const QString &id, bool save = true);
     void addWorkspace();
     void removeWorkspace();

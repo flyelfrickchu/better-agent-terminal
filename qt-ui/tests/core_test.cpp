@@ -2,6 +2,7 @@
 #include "transcript.h"
 #include "terminalpanel.h"
 #include "mainwindow.h"
+#include "agentpanel.h"
 #include "settingsdialog.h"
 #include "gitpanel.h"
 #include <QTabBar>
@@ -37,6 +38,7 @@
 #include <QUrlQuery>
 #include <QWebSocketServer>
 #include <QMessageBox>
+#include <QMenu>
 
 class CoreTest : public QObject {
     Q_OBJECT
@@ -507,6 +509,7 @@ private slots:
         QString seenContext;
         QJsonObject savedSettings;
         QJsonObject savedWorkspace;
+        QStringList stoppedSessions;
         bool delayWorkspaceSaves = false;
         bool rejectNextWorkspaceSave = false;
         int workspaceLoads = 0;
@@ -550,6 +553,12 @@ private slots:
                         return;
                     }
                     connection->sendTextMessage(QString::fromUtf8(QJsonDocument(echo).toJson(QJsonDocument::Compact)));
+                } else if (frame["channel"] == "claude:get-session-state") {
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]},
+                        {"result", QJsonObject{{"isStreaming", true}, {"messages", QJsonArray{}}}}};
+                } else if (frame["channel"] == "claude:stop-session") {
+                    stoppedSessions.append(frame["params"].toObject()["sessionId"].toString());
+                    response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", true}};
                 } else if (frame["channel"] == "fs:isDirectory") {
                     response = {{"type", "invoke-result"}, {"id", frame["id"]}, {"result", true}};
                 } else if (frame["channel"] == "workspace:load") {
@@ -717,6 +726,95 @@ private slots:
         QCOMPARE(tabs->count(), 2);
         unsaved->sendInput("printf survived > failed-save-alive.txt\n");
         QTRY_VERIFY(QFile::exists(directory.filePath("failed-save-alive.txt")));
+        // Project removal must be reachable from the real context menu,
+        // confirm before deleting, and leave other projects and files alone.
+        QTRY_VERIFY(!window.m_saveInFlight);
+        auto removalSnapshot = window.m_snapshot;
+        auto removalQt = removalSnapshot["qtUi"].toObject();
+        const auto removalWorkspaces = removalSnapshot["workspaces"].toArray();
+        QCOMPARE(removalWorkspaces.size(), 2);
+        QString otherWorkspace;
+        for (const auto &entry : removalWorkspaces)
+            if (entry.toObject()["id"] != existingWorkspace) otherWorkspace = entry.toObject()["id"].toString();
+        QVERIFY(!otherWorkspace.isEmpty());
+        removalQt["projects"] = QJsonArray{
+            QJsonObject{{"id", "remove-me"}, {"name", "Remove me"}, {"workspaceIds", QJsonArray{existingWorkspace}}},
+            QJsonObject{{"id", "keep-me"}, {"name", "Keep me"}, {"workspaceIds", QJsonArray{otherWorkspace}}, {"future", 42}},
+            QJsonObject{{"id", "empty"}, {"name", "Empty"}, {"workspaceIds", QJsonArray{}}}};
+        removalQt["activeProjectId"] = "remove-me";
+        removalSnapshot["qtUi"] = removalQt;
+        window.applySnapshot(removalSnapshot, true);
+        window.m_saveTimer.stop();
+        auto *otherTabs = window.m_workspaceTabs.value(otherWorkspace);
+        QPointer<QWidget> otherPanel = new QWidget(otherTabs);
+        otherPanel->setProperty("tabId", "keep-tab");
+        otherPanel->setProperty("descriptor", QVariantMap{{"id", "keep-tab"}, {"workspaceId", otherWorkspace}});
+        otherTabs->addTab(otherPanel, "Keep tab");
+        window.createTab({{"id", "remove-agent"}, {"workspaceId", existingWorkspace}, {"kind", "agent"},
+            {"cwd", directory.path()}, {"agentPreset", "claude-code"}}, false);
+        QPointer<AgentPanel> removedAgent = qobject_cast<AgentPanel *>(tabs->widget(2));
+        QVERIFY(removedAgent);
+        QTRY_VERIFY(removedAgent->busy());
+        window.show();
+        const auto removeFromMenu = [&](int index, QMessageBox::StandardButton answer) {
+            bool found = false;
+            auto *group = window.m_workspaces->topLevelItem(index);
+            window.m_workspaces->scrollToItem(group);
+            QTimer::singleShot(0, &window, [&] {
+                auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+                if (!menu) return;
+                QAction *remove = nullptr;
+                for (auto *action : menu->actions())
+                    if (action->text() == "Remove project") remove = action;
+                menu->close();
+                if (!remove) return;
+                found = true;
+                QTimer::singleShot(0, &window, [&, answer] {
+                    auto *dialog = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                    if (dialog) dialog->button(answer)->click();
+                });
+                remove->trigger();
+            });
+            window.m_workspaces->customContextMenuRequested(window.m_workspaces->visualItemRect(group).center());
+            return found;
+        };
+        QVERIFY2(removeFromMenu(0, QMessageBox::No), "Project context menu must offer Remove project");
+        QCOMPARE(window.m_snapshot["workspaces"].toArray(), removalWorkspaces);
+        QCOMPARE(window.m_workspaces->topLevelItemCount(), 3);
+        QVERIFY(terminal); QVERIFY(unsaved);
+        QVERIFY(removedAgent); QVERIFY(stoppedSessions.isEmpty());
+        QVERIFY(removeFromMenu(0, QMessageBox::Yes));
+        QTRY_VERIFY(!window.m_saveInFlight);
+        QTRY_COMPARE(window.m_workspaces->topLevelItemCount(), 2);
+        QVERIFY(!terminal); QVERIFY(!unsaved);
+        QVERIFY(!removedAgent);
+        QTRY_COMPARE(stoppedSessions, QStringList{"remove-agent"});
+        QVERIFY(otherPanel);
+        QVERIFY(!window.m_workspaceTabs.contains(existingWorkspace));
+        QCOMPARE(window.m_workspaceTabs.value(otherWorkspace), otherTabs);
+        QCOMPARE(window.m_workspaceId, otherWorkspace);
+        QCOMPARE(window.m_projectId, QString("keep-me"));
+        QCOMPARE(savedWorkspace["workspaces"].toArray().size(), 1);
+        QCOMPARE(savedWorkspace["workspaces"].toArray().first().toObject()["id"].toString(), otherWorkspace);
+        QCOMPARE(savedWorkspace["qtUi"].toObject()["projects"].toArray().first().toObject()["future"].toInt(), 42);
+        QCOMPARE(savedWorkspace["qtUi"].toObject()["tabs"].toArray().size(), 1);
+        QVERIFY(QFile::exists(directory.filePath("failed-save-alive.txt")));
+        reopened.applySnapshot(savedWorkspace);
+        QCOMPARE(reopened.m_workspaces->topLevelItemCount(), 2);
+        QCOMPARE(reopened.m_workspaces->topLevelItem(0)->childCount(), 1);
+        QVERIFY(removeFromMenu(1, QMessageBox::Yes)); // Empty groups are removable too.
+        QTRY_VERIFY(!window.m_saveInFlight);
+        QTRY_COMPARE(window.m_workspaces->topLevelItemCount(), 1);
+        QVERIFY(otherPanel);
+        QVERIFY(removeFromMenu(0, QMessageBox::Yes)); // Removing the last group stays empty on reload.
+        QTRY_VERIFY(!window.m_saveInFlight);
+        QTRY_COMPARE(window.m_workspaces->topLevelItemCount(), 0);
+        QVERIFY(!otherPanel);
+        QVERIFY(savedWorkspace["workspaces"].toArray().isEmpty());
+        QVERIFY(savedWorkspace["qtUi"].toObject()["projects"].toArray().isEmpty());
+        QVERIFY(savedWorkspace["qtUi"].toObject()["activeProjectId"].toString().isEmpty());
+        reopened.applySnapshot(savedWorkspace);
+        QCOMPARE(reopened.m_workspaces->topLevelItemCount(), 0);
         window.m_host.disconnectFromHost();
         peer = originalPeer;
         GitPanel gitPanel(&client);
