@@ -1,13 +1,14 @@
 # Native Qt/KDE UI
 
 The `dev_qt` migration uses Qt 6 Widgets and KDE Frameworks 6. Every local
-terminal embeds Konsole's KPart, which owns its shell and PTY. Agent requests
+terminal defaults to Konsole's KPart, which owns its shell and PTY. Third-party
+X11 terminals can also be embedded in BAT tabs. Agent requests
 use the existing BAT host protocol (`bat-remote/v2`) and profile contexts.
 
 ## Build on Kubuntu
 
 ```sh
-sudo apt-get install cmake qt6-base-dev qt6-websockets-dev libkf6parts-dev libkf6coreaddons-dev konsole-kpart
+sudo apt-get install cmake qt6-base-dev qt6-websockets-dev libkf6parts-dev libkf6coreaddons-dev konsole-kpart libxcb1-dev
 cmake -S qt-ui -B qt-ui/build -DCMAKE_BUILD_TYPE=Debug
 cmake --build qt-ui/build -j2
 ctest --test-dir qt-ui/build --output-on-failure
@@ -71,7 +72,7 @@ Groups, empty Projects, membership, and collapsed state
 are saved with the host profile. Existing workspaces appear in `Project_00`.
 
 Use **Add workspace** to select a folder in the selected Project. Each local workspace starts with
-a Konsole tab; **Konsole** adds another. Closing a workspace or terminal
+a terminal tab; **Terminal** adds another. Closing a workspace or terminal
 asks for confirmation because it terminates its running processes.
 
 Use **Connect** with the connection URL from BAT's remote server.
@@ -90,6 +91,39 @@ applies immediately; terminal profiles and agent defaults apply to new tabs.
 Terminal shell, font, and colors are managed by the selected Konsole profile.
 Unknown settings and the built-in status line configuration are preserved.
 Loading, connection, validation, and save failures are shown in the dialog.
+
+In **Settings → Terminal**, keep **Konsole (embedded, default)** or choose
+**Third-party app (embedded, X11)**. Enter an installed program name from PATH
+or browse to its absolute executable path. **Ghostty** and **WezTerm** fill
+editable launch and CLI argument presets. Other X11 terminal apps can be used
+with their own arguments; compatibility depends on the app.
+
+`{cwd}` inserts the workspace directory into one argument, preserving spaces.
+CLI command arguments use a separate `{command}` token, expanded to the
+Claude/Codex executable and argument list. Double quotes group arguments;
+shell expansion, pipes and redirects are not interpreted. New tabs save their
+terminal configuration; existing and restored tabs retain their original app.
+Konsole profiles apply only to Konsole tabs.
+
+Third-party embedding requires BAT's **xcb/X11 backend**, including XWayland
+when BAT itself runs with `QT_QPA_PLATFORM=xcb`. Native Wayland embedding is
+unsupported. Terminals must create **one window in a new process**, publish
+their X11 PID, and remain in their launched process group. Disable restoration
+of multiple windows. Single-instance/server launchers are unsupported; use the
+provided new-process presets where available. A window may briefly appear
+before BAT reparents it into the tab. Extra windows from an owned instance stop
+that instance and show an error in the BAT tab. A misconfigured launcher that
+delegates to an existing server may create a window BAT cannot manage.
+Closing a BAT tab stops the process group it started. Fonts, colors and shell
+settings for third-party apps are managed by those apps.
+
+The Qt suite covers settings persistence, literal arguments, embedding,
+resize, restoration, process isolation and cleanup. To also exercise installed
+Ghostty and WezTerm on X11 (with an appropriate Qt/KDE runtime environment):
+
+```sh
+QT_QPA_PLATFORM=xcb BAT_TEST_TERMINALS=wezterm,ghostty xvfb-run -a dist/qt-build/native/bat-qt-tests
+```
 
 **Git** switches to an embedded workspace view above the running terminal/agent
 sessions. Its three columns show commits (including uncommitted changes), changed

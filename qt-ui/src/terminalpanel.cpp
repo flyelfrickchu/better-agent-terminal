@@ -1,4 +1,5 @@
 #include "terminalpanel.h"
+#include "externalterminal.h"
 #include <KParts/ReadOnlyPart>
 #include <KPluginFactory>
 #include <KPluginMetaData>
@@ -7,9 +8,17 @@
 #include <QVBoxLayout>
 
 TerminalPanel::TerminalPanel(const QString &directory, const QString &program,
-                             const QStringList &arguments, QWidget *parent, const QString &profile) : QWidget(parent) {
+                             const QStringList &arguments, QWidget *parent, const QString &profile,
+                             const QJsonObject &terminalSettings) : QWidget(parent) {
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
+    if (terminalSettings["terminalBackend"] == "external") {
+        m_external = new ExternalTerminalPanel(terminalSettings, directory, program, arguments, this);
+        layout->addWidget(m_external);
+        connect(m_external, &ExternalTerminalPanel::exited, this, &TerminalPanel::exited);
+        setFocusProxy(m_external);
+        return;
+    }
     const auto factory = KPluginFactory::loadFactory(KPluginMetaData("kf6/parts/konsolepart"));
     if (factory.plugin) m_part = factory.plugin->create<KParts::ReadOnlyPart>(this);
     auto *terminal = m_part ? qobject_cast<TerminalInterface *>(m_part.data()) : nullptr;
@@ -42,6 +51,11 @@ TerminalPanel::~TerminalPanel() {
     // Disconnect before QWidget destroys children, when ancestor tabs may
     // already be partially destroyed and this panel's members are gone.
     if (m_part) QObject::disconnect(m_part.data(), nullptr, this, nullptr);
+    if (m_external) QObject::disconnect(m_external, nullptr, this, nullptr);
+}
+
+bool TerminalPanel::available() const {
+    return m_external ? m_external->available() : !m_part.isNull();
 }
 
 void TerminalPanel::sendInput(const QString &text) {

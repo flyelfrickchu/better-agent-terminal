@@ -1,9 +1,11 @@
 #include "settingsdialog.h"
 #include "hostclient.h"
+#include "externalterminal.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFontComboBox>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QJsonDocument>
 #include <QLabel>
@@ -12,6 +14,8 @@
 #include <QSpinBox>
 #include <QTabWidget>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QScrollArea>
 
 SettingsDialog::SettingsDialog(HostClient *host, const QStringList &profiles, QWidget *parent)
     : QDialog(parent), m_host(host), m_context(host->contextId()) {
@@ -21,10 +25,12 @@ SettingsDialog::SettingsDialog(HostClient *host, const QStringList &profiles, QW
     m_tabs = new QTabWidget(this);
     layout->addWidget(m_tabs, 1);
     auto page = [this](const QString &title) {
-        auto *widget = new QWidget(m_tabs);
+        auto *scroll = new QScrollArea(m_tabs);
+        scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame);
+        auto *widget = new QWidget(scroll);
         auto *form = new QFormLayout(widget);
         form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        m_tabs->addTab(widget, title);
+        scroll->setWidget(widget); m_tabs->addTab(scroll, title);
         return form;
     };
     auto choice = [this](QFormLayout *form, const QString &key, const QString &label,
@@ -55,12 +61,44 @@ SettingsDialog::SettingsDialog(HostClient *host, const QStringList &profiles, QW
     appearance->addRow(tr("Interface font"), font); m_fields.insert("qt.fontFamily", font);
     number(appearance, "qt.fontSize", tr("Interface font size"), 8, 32);
     auto *terminal = page(tr("Terminal"));
+    choice(terminal, "qt.terminalBackend", tr("Terminal app"),
+        {tr("Konsole (embedded, default)"), tr("Third-party app (embedded, X11)")}, {"konsole", "external"});
+    text(terminal, "qt.terminalExecutable", tr("Executable"), tr("Program in PATH or absolute path"));
+    auto *browse = new QPushButton(tr("Browse…"), this);
+    browse->setObjectName("browseTerminalExecutable"); terminal->addRow(QString(), browse);
+    connect(browse, &QPushButton::clicked, this, [this] {
+        const auto path = QFileDialog::getOpenFileName(this, tr("Select terminal executable"), "/usr/bin");
+        if (!path.isEmpty()) qobject_cast<QLineEdit *>(m_fields["qt.terminalExecutable"])->setText(path);
+    });
+    text(terminal, "qt.terminalArguments", tr("Launch arguments"));
+    text(terminal, "qt.terminalCommandArguments", tr("CLI command arguments"), "-e {command}");
+    auto *presets = new QWidget(this); auto *presetLayout = new QHBoxLayout(presets);
+    presetLayout->setContentsMargins(0, 0, 0, 0);
+    auto preset = [this, presetLayout](const QString &label, const QString &program,
+                                     const QString &arguments, const QString &commandArguments) {
+        auto *button = new QPushButton(label, this); presetLayout->addWidget(button);
+        button->setObjectName("terminalPreset" + label);
+        connect(button, &QPushButton::clicked, this, [this, program, arguments, commandArguments] {
+            auto *backend = qobject_cast<QComboBox *>(m_fields["qt.terminalBackend"]);
+            backend->setCurrentIndex(backend->findData("external"));
+            qobject_cast<QLineEdit *>(m_fields["qt.terminalExecutable"])->setText(program);
+            qobject_cast<QLineEdit *>(m_fields["qt.terminalArguments"])->setText(arguments);
+            qobject_cast<QLineEdit *>(m_fields["qt.terminalCommandArguments"])->setText(commandArguments);
+        });
+    };
+    preset("Ghostty", "ghostty", "--gtk-single-instance=false --working-directory={cwd}", "-e {command}");
+    preset("WezTerm", "wezterm", "--config enable_wayland=false start --always-new-process --cwd {cwd}", "-- {command}");
+    terminal->addRow(tr("Fill preset"), presets);
+    auto *embeddingNote = new QLabel(tr("Third-party apps run inside BAT tabs on X11. Use one window per new process; disable session/window restoration. Apps that reuse an existing server or require Wayland are unsupported. Compatibility varies by app.\n{cwd} inserts the workspace path. {command} inserts Claude/Codex and its arguments. Use double quotes to group arguments; shell expansion is not performed."), this);
+    embeddingNote->setWordWrap(true); terminal->addRow(embeddingNote);
+    const auto embeddingError = ExternalTerminalPanel::platformError();
+    if (!embeddingError.isEmpty()) { auto *warning = new QLabel(embeddingError, this); warning->setWordWrap(true); terminal->addRow(warning); }
     QStringList profileLabels{tr("KDE default profile")}, profileValues{QString()};
     for (const auto &profile : profiles) if (!profileValues.contains(profile)) {
         profileLabels.append(profile); profileValues.append(profile);
     }
     choice(terminal, "qt.konsoleProfile", tr("Konsole profile"), profileLabels, profileValues);
-    auto *note = new QLabel(tr("New terminals use this Konsole profile, including its shell, colors and font.\nEdit profiles using Konsole’s Settings → Manage Profiles."), this);
+    auto *note = new QLabel(tr("Konsole terminals use this profile, including its shell, colors and font.\nEdit profiles using Konsole’s Settings → Manage Profiles. Terminal app changes apply to new tabs; restored tabs retain their app."), this);
     note->setWordWrap(true); terminal->addRow(note);
 
     auto *agents = page(tr("Agents"));
@@ -72,7 +110,7 @@ SettingsDialog::SettingsDialog(HostClient *host, const QStringList &profiles, QW
     auto *agentNote = new QLabel(tr("Defaults apply to new agent tabs. Existing sessions keep their configuration."), this);
     agentNote->setWordWrap(true); agents->addRow(agentNote);
     auto *workspaces = page(tr("Workspaces"));
-    number(workspaces, "defaultTerminalCount", tr("Konsole tabs in a new workspace"), 1, 10);
+    number(workspaces, "defaultTerminalCount", tr("Terminal tabs in a new workspace"), 1, 10);
     check(workspaces, "createDefaultAgentTerminal", tr("Also create a default agent tab"));
     check(workspaces, "closeTerminalAfterProcessExit", tr("Close terminal tabs when their process exits"));
     auto *python = page(tr("Python"));
@@ -90,6 +128,16 @@ SettingsDialog::SettingsDialog(HostClient *host, const QStringList &profiles, QW
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     connect(m_retry, &QPushButton::clicked, this, &SettingsDialog::load);
     setSettings({});
+    auto updateTerminalFields = [this, browse, presets] {
+        const bool external = qobject_cast<QComboBox *>(m_fields["qt.terminalBackend"])->currentData() == "external";
+        for (const auto &key : {"qt.terminalExecutable", "qt.terminalArguments", "qt.terminalCommandArguments"})
+            m_fields[key]->setEnabled(external);
+        browse->setEnabled(external); presets->setEnabled(true);
+        m_fields["qt.konsoleProfile"]->setEnabled(!external);
+    };
+    connect(qobject_cast<QComboBox *>(m_fields["qt.terminalBackend"]), &QComboBox::currentIndexChanged,
+        this, updateTerminalFields);
+    updateTerminalFields();
     load();
 }
 
@@ -120,13 +168,15 @@ void SettingsDialog::setSettings(const QJsonObject &settings) {
         } else if (auto *choice = qobject_cast<QComboBox *>(widget)) {
             QString fallback;
             if (key == "theme") fallback = "system";
+            if (key == "terminalBackend") fallback = "konsole";
             if (key == "defaultAgent") fallback = "claude-code";
             const QString selected = value.toString(fallback);
             int index = choice->findData(selected);
             if (index < 0) { choice->addItem(selected, selected); index = choice->count() - 1; }
             choice->setCurrentIndex(index);
         } else if (auto *text = qobject_cast<QLineEdit *>(widget)) {
-            text->setText(value.toString(key == "agentPythonVenvPath" ? ".venv" : QString()));
+            text->setText(value.toString(key == "agentPythonVenvPath" ? ".venv" :
+                key == "terminalCommandArguments" ? "-e {command}" : QString()));
         } else if (auto *number = qobject_cast<QSpinBox *>(widget)) {
             number->setValue(value.toInt(key == "fontSize" ? (QFont().pointSize() > 0 ? QFont().pointSize() : 10) : 1));
         } else if (auto *check = qobject_cast<QCheckBox *>(widget)) check->setChecked(value.toBool());
@@ -174,6 +224,13 @@ void SettingsDialog::save() {
         m_status->setText(tr("The host or profile changed. Reopen Settings.")); return;
     }
     const auto proposed = settings();
+    const auto terminalSettings = proposed["qtUi"].toObject();
+    if (terminalSettings["terminalBackend"] == "external") {
+        const auto error = ExternalTerminalPanel::validate(terminalSettings);
+        if (!error.isEmpty()) { m_status->setText(error); return; }
+        const auto platformError = ExternalTerminalPanel::platformError();
+        if (!platformError.isEmpty()) { m_status->setText(platformError); return; }
+    }
     if (proposed["agentPythonVenvEnabled"].toBool() && proposed["agentPythonVenvPath"].toString().isEmpty()) {
         m_status->setText(tr("Enter a virtual environment path, such as .venv.")); return;
     }

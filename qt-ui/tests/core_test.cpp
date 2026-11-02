@@ -1,6 +1,7 @@
 #include "hostclient.h"
 #include "transcript.h"
 #include "terminalpanel.h"
+#include "externalterminal.h"
 #include "mainwindow.h"
 #include "agentpanel.h"
 #include "settingsdialog.h"
@@ -39,6 +40,11 @@
 #include <QWebSocketServer>
 #include <QMessageBox>
 #include <QMenu>
+#include <QLabel>
+#include <QWindow>
+#include <QSaveFile>
+#include <QRegularExpression>
+#include <QVBoxLayout>
 
 class CoreTest : public QObject {
     Q_OBJECT
@@ -255,6 +261,185 @@ private slots:
         QVERIFY(updated["qtUi"].toObject()["unknownNativeSetting"].toBool());
         QCOMPARE(updated["qtUi"].toObject()["theme"].toString(), QString("light"));
         QVERIFY(!dialog.findChild<QPushButton *>("saveSettings")->isEnabled());
+    }
+    void thirdPartyTerminalSettingsRoundTrip() {
+        HostClient host;
+        SettingsDialog dialog(&host, {});
+        auto *backend = dialog.findChild<QComboBox *>("qt.terminalBackend");
+        QVERIFY2(backend, "Settings must offer an embedded third-party terminal backend");
+        QCOMPARE(backend->currentData().toString(), QString("konsole"));
+        auto *executable = dialog.findChild<QLineEdit *>("qt.terminalExecutable");
+        auto *arguments = dialog.findChild<QLineEdit *>("qt.terminalArguments");
+        auto *commandArguments = dialog.findChild<QLineEdit *>("qt.terminalCommandArguments");
+        QVERIFY(executable); QVERIFY(arguments); QVERIFY(commandArguments);
+        dialog.setSettings({{"qtUi", QJsonObject{{"terminalBackend", "external"},
+            {"terminalExecutable", "/opt/My Terminal/terminal"},
+            {"terminalArguments", "--cwd \"{cwd}\""},
+            {"terminalCommandArguments", "-e {command}"}, {"future", 42}}}});
+        QCOMPARE(executable->text(), QString("/opt/My Terminal/terminal"));
+        executable->setText("wezterm");
+        const auto saved = dialog.settings()["qtUi"].toObject();
+        QCOMPARE(saved["terminalBackend"].toString(), QString("external"));
+        QCOMPARE(saved["terminalExecutable"].toString(), QString("wezterm"));
+        QCOMPARE(saved["terminalArguments"].toString(), QString("--cwd \"{cwd}\""));
+        QCOMPARE(saved["terminalCommandArguments"].toString(), QString("-e {command}"));
+        QCOMPARE(saved["future"].toInt(), 42);
+    }
+    void terminalArgumentsKeepPathsAndCommandsLiteral() {
+        QTemporaryDir base;
+        const QString cwd = base.filePath("a space \"quoted\" $(touch injected)");
+        QVERIFY(QDir().mkpath(cwd));
+        QJsonObject settings{{"terminalExecutable", "/bin/echo"},
+            {"terminalArguments", "--cwd=\"{cwd}\" --label \"two words\""},
+            {"terminalCommandArguments", "-- {command}"}};
+        QString executable, error; QStringList arguments;
+        QVERIFY(ExternalTerminalPanel::launchCommand(settings, cwd, "/opt/my cli",
+            {"literal;value", "two words"}, executable, arguments, error));
+        QCOMPARE(arguments, (QStringList{"--cwd=" + cwd, "--label", "two words", "--", "/opt/my cli", "literal;value", "two words"}));
+        QVERIFY(ExternalTerminalPanel::launchCommand(settings, cwd, {}, {}, executable, arguments, error));
+        QCOMPARE(arguments.size(), 3); // No command separator for a plain shell.
+        settings["terminalArguments"] = "\"unfinished";
+        QVERIFY(!ExternalTerminalPanel::validate(settings).isEmpty());
+        settings["terminalArguments"] = "";
+        settings["terminalCommandArguments"] = "-e prefix{command}";
+        QVERIFY(!ExternalTerminalPanel::validate(settings).isEmpty());
+        settings["terminalCommandArguments"] = "-e {command}";
+        settings["terminalExecutable"] = "/does/not/exist";
+        QVERIFY(!ExternalTerminalPanel::validate(settings).isEmpty());
+        QVERIFY(!QFileInfo::exists(base.filePath("injected")));
+    }
+    void thirdPartyWindowEmbedsResizesRestoresAndCleansUp() {
+        if (QGuiApplication::platformName() != "xcb" || !ExternalTerminalPanel::platformError().isEmpty())
+            QSKIP("Requires the X11 backend; run under Xvfb with QT_QPA_PLATFORM=xcb");
+        QTemporaryDir directory;
+        QProcess unrelated; unrelated.start("/bin/sleep", {"60"}); QVERIFY(unrelated.waitForStarted());
+        MainWindow window(directory.path());
+        auto *tabs = new QTabWidget(window.m_pages);
+        window.m_pages->addWidget(tabs); window.m_workspaceTabs.insert("workspace", tabs);
+        // The test binary uses an isolated Qt/KDE SDK. Restore that SDK only
+        // for this fixture, after BAT strips its private runtime environment.
+        const QString probeArguments = QString("\"LD_LIBRARY_PATH=%1\" \"QT_PLUGIN_PATH=%2\" \"%3\" --terminal-window-probe {cwd} \"two words\"")
+            .arg(qEnvironmentVariable("LD_LIBRARY_PATH"), qEnvironmentVariable("QT_PLUGIN_PATH"), QCoreApplication::applicationFilePath());
+        const QJsonObject configuration{{"terminalBackend", "external"},
+            {"terminalExecutable", "/usr/bin/env"},
+            {"terminalArguments", probeArguments + " temporary-splash"},
+            {"terminalCommandArguments", "-- {command}"}};
+        const QJsonObject descriptor{{"id", "third-party"}, {"kind", "terminal"},
+            {"workspaceId", "workspace"}, {"cwd", directory.path()}, {"terminalSettings", configuration}};
+        window.createTab(descriptor, false); window.m_pages->setCurrentWidget(tabs); window.show();
+        auto *panel = qobject_cast<TerminalPanel *>(tabs->widget(0)); QVERIFY(panel);
+        QTRY_VERIFY_WITH_TIMEOUT(panel->available(), 5000);
+        QTest::qWait(700); QVERIFY(panel->available()); // A closing splash must not stop the terminal.
+        QVERIFY(!panel->findChild<KParts::ReadOnlyPart *>());
+        auto *container = panel->findChild<QWidget *>("externalTerminalContainer"); QVERIFY(container);
+        auto readProbe = [&] {
+            QFile file(directory.filePath("terminal-probe.json"));
+            if (!file.open(QIODevice::ReadOnly)) return QJsonObject{};
+            return QJsonDocument::fromJson(file.readAll()).object();
+        };
+        QTRY_VERIFY(!readProbe().isEmpty());
+        const qint64 pid = readProbe()["pid"].toInteger(); QVERIFY(pid > 0);
+        QCOMPARE(readProbe()["cwd"].toString(), directory.path());
+        QCOMPARE(readProbe()["args"].toArray().first().toString(), QString("two words"));
+        QTRY_VERIFY(container->isVisible());
+        const int before = container->width(); window.resize(window.width() + 120, window.height() + 80);
+        QTRY_VERIFY(container->width() > before);
+        QTRY_COMPARE(readProbe()["width"].toInt(), container->width());
+        QTRY_VERIFY(readProbe()["parent"].toString() != readProbe()["root"].toString());
+        window.m_settings = {{"qtUi", QJsonObject{{"terminalBackend", "konsole"}}}};
+        window.createTab(descriptor, false); QCOMPARE(tabs->count(), 1); // No duplicate instance on reload.
+        QVERIFY(panel->available());
+        QSignalSpy exited(panel, &TerminalPanel::exited);
+        window.clearPages();
+        QTRY_VERIFY(!QFileInfo::exists(QString("/proc/%1").arg(pid)));
+        QCOMPARE(exited.count(), 0);
+        QCOMPARE(unrelated.state(), QProcess::Running);
+        // Restore after a settings change still uses the saved third-party app.
+        tabs = new QTabWidget(window.m_pages); window.m_pages->addWidget(tabs);
+        window.m_workspaceTabs.insert("workspace", tabs);
+        window.createTab(descriptor, false);
+        panel = qobject_cast<TerminalPanel *>(tabs->widget(0)); QVERIFY(panel);
+        QTRY_VERIFY_WITH_TIMEOUT(panel->available(), 5000);
+        QSignalSpy restoredExited(panel, &TerminalPanel::exited);
+        QFile exitRequest(directory.filePath("exit-terminal")); QVERIFY(exitRequest.open(QIODevice::WriteOnly)); exitRequest.close();
+        QTRY_COMPARE_WITH_TIMEOUT(restoredExited.count(), 1, 5000);
+        QVERIFY(!panel->available());
+        unrelated.kill(); QVERIFY(unrelated.waitForFinished());
+    }
+    void unsupportedTerminalShowsAnErrorWithoutLaunching() {
+        if (QGuiApplication::platformName() == "xcb") QSKIP("Checks the non-X11 failure path");
+        QTemporaryDir directory;
+        TerminalPanel panel(directory.path(), {}, {}, nullptr, {},
+            {{"terminalBackend", "external"}, {"terminalExecutable", "/bin/echo"},
+             {"terminalCommandArguments", "-e {command}"}});
+        QVERIFY(!panel.available());
+        const auto *status = panel.findChild<QLabel *>("externalTerminalStatus");
+        QVERIFY(status); QVERIFY(status->text().contains("X11"));
+        QVERIFY(!panel.findChild<KParts::ReadOnlyPart *>());
+    }
+    void thirdPartyExtraWindowsAreStopped() {
+        if (QGuiApplication::platformName() != "xcb" || !ExternalTerminalPanel::platformError().isEmpty())
+            QSKIP("Requires X11");
+        QTemporaryDir directory;
+        const auto arguments = QString("\"LD_LIBRARY_PATH=%1\" \"QT_PLUGIN_PATH=%2\" \"%3\" --terminal-window-probe {cwd} extra-window")
+            .arg(qEnvironmentVariable("LD_LIBRARY_PATH"), qEnvironmentVariable("QT_PLUGIN_PATH"), QCoreApplication::applicationFilePath());
+        TerminalPanel panel(directory.path(), {}, {}, nullptr, {}, {{"terminalBackend", "external"},
+            {"terminalExecutable", "/usr/bin/env"}, {"terminalArguments", arguments},
+            {"terminalCommandArguments", "-e {command}"}});
+        panel.show();
+        const auto *status = panel.findChild<QLabel *>("externalTerminalStatus"); QVERIFY(status);
+        QTRY_VERIFY_WITH_TIMEOUT(status->text().contains("multiple windows"), 5000);
+        QVERIFY(!panel.available());
+        QFile file(directory.filePath("terminal-probe.json")); QVERIFY(file.open(QIODevice::ReadOnly));
+        const auto pid = QJsonDocument::fromJson(file.readAll()).object()["pid"].toInteger();
+        QVERIFY(pid > 0); QTRY_VERIFY(!QFileInfo::exists(QString("/proc/%1").arg(pid)));
+    }
+    void installedThirdPartyTerminal_data() {
+        QTest::addColumn<QString>("name");
+        QTest::addColumn<bool>("closeWhileRunning");
+        const auto names = qEnvironmentVariable("BAT_TEST_TERMINALS").split(',', Qt::SkipEmptyParts);
+        if (names.isEmpty()) QTest::newRow("opt-in") << QString() << false;
+        for (const auto &name : names) {
+            QTest::newRow(qPrintable(name + "-exit")) << name << false;
+            QTest::newRow(qPrintable(name + "-close-tab")) << name << true;
+        }
+    }
+    void installedThirdPartyTerminal() {
+        QFETCH(QString, name);
+        QFETCH(bool, closeWhileRunning);
+        if (name.isEmpty()) QSKIP("Set BAT_TEST_TERMINALS=wezterm,ghostty for installed-app integration tests");
+        QVERIFY2(ExternalTerminalPanel::platformError().isEmpty(), "Installed-app integration requires X11");
+        QTemporaryDir directory;
+        QJsonObject settings{{"terminalBackend", "external"}, {"terminalExecutable", name},
+            {"terminalArguments", name == "wezterm"
+                ? "--config enable_wayland=false start --always-new-process --cwd {cwd}"
+                : "--gtk-single-instance=false --working-directory={cwd}"},
+            {"terminalCommandArguments", name == "wezterm" ? "-- {command}" : "-e {command}"}};
+        auto panel = std::make_unique<TerminalPanel>(directory.path(), "/bin/sh", QStringList{"-c",
+            "pwd > actual-cwd.txt; echo $$ > shell-pid.txt; while [ ! -e exit-terminal ]; do sleep 0.1; done"}, nullptr, QString(), settings);
+        panel->resize(640, 480); panel->show();
+        QTRY_VERIFY_WITH_TIMEOUT(panel->available() || !panel->findChild<QLabel *>("externalTerminalStatus")->text().contains("Starting"), 20000);
+        QVERIFY2(panel->available(), qPrintable(panel->findChild<QLabel *>("externalTerminalStatus")->text()));
+        QFile output(directory.filePath("actual-cwd.txt"));
+        QTRY_VERIFY_WITH_TIMEOUT(output.exists(), 5000); QVERIFY(output.open(QIODevice::ReadOnly));
+        QCOMPARE(QString::fromUtf8(output.readAll()).trimmed(), directory.path());
+        const auto *container = panel->findChild<QWidget *>("externalTerminalContainer"); QVERIFY(container);
+        const int width = container->width(); panel->resize(800, 600); QTRY_VERIFY(container->width() > width);
+        QFile shellPidFile(directory.filePath("shell-pid.txt")); QVERIFY(shellPidFile.open(QIODevice::ReadOnly));
+        const auto shellPid = shellPidFile.readAll().trimmed().toLongLong(); QVERIFY(shellPid > 0);
+        if (closeWhileRunning) {
+            panel.reset();
+            auto shellRunning = [&] {
+                QFile status(QString("/proc/%1/status").arg(shellPid));
+                return status.open(QIODevice::ReadOnly) && !status.readAll().contains("State:\tZ");
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(!shellRunning(), 5000);
+            return;
+        }
+        QSignalSpy exited(panel.get(), &TerminalPanel::exited);
+        QFile request(directory.filePath("exit-terminal")); QVERIFY(request.open(QIODevice::WriteOnly)); request.close();
+        QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 1, 5000);
+        QVERIFY(!panel->available());
     }
     void legacyWorkspacesAppearUnderDefaultProject() {
         QTemporaryDir directory;
@@ -867,6 +1052,39 @@ private slots:
 };
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    if (argc >= 3 && QByteArray(argv[1]) == "--terminal-window-probe") {
+        QWidget window; auto *layout = new QVBoxLayout(&window);
+        if (app.arguments().contains("temporary-splash")) {
+            auto *splash = new QWidget(nullptr, Qt::SplashScreen);
+            splash->setAttribute(Qt::WA_DeleteOnClose); splash->resize(100, 100); splash->show();
+            QTimer::singleShot(500, splash, &QWidget::close);
+        }
+        if (app.arguments().contains("extra-window")) {
+            auto *extra = new QWidget; extra->setAttribute(Qt::WA_DeleteOnClose);
+            QTimer::singleShot(500, extra, &QWidget::show);
+        }
+        layout->addWidget(new QLineEdit(&window)); window.resize(300, 200); window.show();
+        const auto record = [&] {
+            QProcess info;
+            info.start("xwininfo", {"-id", QString::number(window.winId()), "-tree"});
+            info.waitForFinished(500);
+            const auto tree = QString::fromLocal8Bit(info.readAllStandardOutput());
+            const auto parent = QRegularExpression("Parent window id: (0x[0-9a-fA-F]+)").match(tree).captured(1);
+            const auto root = QRegularExpression("Root window id: (0x[0-9a-fA-F]+)").match(tree).captured(1);
+            QSaveFile file(QString::fromLocal8Bit(argv[2]) + "/terminal-probe.json");
+            if (file.open(QIODevice::WriteOnly)) {
+                file.write(QJsonDocument(QJsonObject{{"cwd", QDir::currentPath()},
+                    {"pid", QCoreApplication::applicationPid()}, {"width", window.width()},
+                    {"parent", parent}, {"root", root},
+                    {"args", QJsonArray::fromStringList(app.arguments().mid(3))}}).toJson());
+                file.commit();
+            }
+            if (QFileInfo::exists(QString::fromLocal8Bit(argv[2]) + "/exit-terminal")) app.quit();
+        };
+        QTimer timer; QObject::connect(&timer, &QTimer::timeout, &app, record);
+        timer.start(100); record();
+        return app.exec();
+    }
     if (argc == 4 && QByteArray(argv[1]) == "--quit-probe")
         return CoreTest::runQuitProbe(app, QByteArray(argv[2]) == "cancel", QByteArray(argv[3]) == "saving");
     CoreTest tests;

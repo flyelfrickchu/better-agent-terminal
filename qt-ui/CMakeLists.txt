@@ -47,6 +47,7 @@ add_library(bat-qt-core STATIC
     src/hostclient.cpp src/hostclient.h
     src/transcript.cpp src/transcript.h
     src/terminalpanel.cpp src/terminalpanel.h
+    src/externalterminal.cpp src/externalterminal.h
     src/settingsdialog.cpp src/settingsdialog.h
     src/gitpanel.cpp src/gitpanel.h
 )
@@ -54,6 +55,14 @@ target_link_libraries(bat-qt-core PUBLIC Qt6::Widgets Qt6::Network Qt6::WebSocke
     KF6::CoreAddons KF6::Parts)
 target_include_directories(bat-qt-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(bat-qt-core PRIVATE -Wall -Wextra -Wpedantic)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(XCB IMPORTED_TARGET xcb)
+    if(XCB_FOUND)
+        target_link_libraries(bat-qt-core PRIVATE PkgConfig::XCB)
+        target_compile_definitions(bat-qt-core PRIVATE BAT_HAVE_XCB)
+    endif()
+endif()
 
 add_executable(better-agent-terminal-qt
     src/main.cpp src/mainwindow.cpp src/mainwindow.h src/agentpanel.cpp src/agentpanel.h)

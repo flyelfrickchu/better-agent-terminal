@@ -134,7 +134,7 @@ void MainWindow::buildUi() {
         openProfile(m_profilePicker->itemData(index).toString());
     });
     toolbar->addAction(QIcon::fromTheme("folder-new"), tr("Add workspace"), this, &MainWindow::addWorkspace);
-    toolbar->addAction(QIcon::fromTheme("utilities-terminal"), tr("Konsole"), this, [this] { addTab("none"); });
+    toolbar->addAction(QIcon::fromTheme("utilities-terminal"), tr("Terminal"), this, [this] { addTab("none"); });
     toolbar->addAction(tr("Claude"), this, [this] { addTab("claude-code"); });
     toolbar->addAction(tr("Codex"), this, [this] { addTab("codex-agent"); });
     toolbar->addSeparator();
@@ -266,7 +266,7 @@ void MainWindow::buildUi() {
         m_workspaceViews->setCurrentIndex(0);
         m_workspaceViews->removeTab(index);
     });
-    auto *welcome = new QLabel(tr("Add a workspace to open a Konsole terminal or agent session."), m_pages);
+    auto *welcome = new QLabel(tr("Add a workspace to open a terminal or agent session."), m_pages);
     welcome->setAlignment(Qt::AlignCenter); welcome->setWordWrap(true); m_pages->addWidget(welcome);
     auto *previewDock = new QDockWidget(tr("File preview"), this); previewDock->setObjectName("preview-dock");
     m_preview = new QTextBrowser(previewDock); m_preview->setOpenExternalLinks(false);
@@ -276,10 +276,10 @@ void MainWindow::buildUi() {
     fileMenu->addAction(tr("Add project"), this, &MainWindow::addProject);
     auto *newWorkspace = fileMenu->addAction(tr("Add workspace"), this, &MainWindow::addWorkspace);
     newWorkspace->setShortcut(QKeySequence("Ctrl+Shift+O"));
-    auto *newTerminal = fileMenu->addAction(tr("New Konsole terminal"), this, [this] { addTab("none"); });
+    auto *newTerminal = fileMenu->addAction(tr("New terminal"), this, [this] { addTab("none"); });
     newTerminal->setShortcut(QKeySequence("Ctrl+Shift+T"));
-    fileMenu->addAction(tr("Claude CLI in Konsole"), this, [this] { addTab("claude-cli"); });
-    fileMenu->addAction(tr("Codex CLI in Konsole"), this, [this] { addTab("codex-cli"); });
+    fileMenu->addAction(tr("Claude CLI in terminal"), this, [this] { addTab("claude-cli"); });
+    fileMenu->addAction(tr("Codex CLI in terminal"), this, [this] { addTab("codex-cli"); });
     fileMenu->addSeparator(); fileMenu->addAction(tr("Connect to host…"), this, &MainWindow::showConnectionDialog);
     fileMenu->addAction(tr("Quit"), this, &QWidget::close)->setShortcut(QKeySequence::Quit);
     auto *viewMenu = menuBar()->addMenu(tr("View"));
@@ -715,13 +715,22 @@ void MainWindow::removeWorkspace() {
 void MainWindow::addTab(const QString &preset) {
     if (!hostReady() || currentDirectory().isEmpty()) { report(tr("Select a workspace first.")); return; }
     if ((preset == "none" || preset.endsWith("-cli")) && !m_localProfile) {
-        report(tr("Embedded Konsole is available for local workspaces. Use agent chat for remote profiles.")); return;
+        report(tr("Embedded terminals are available for local workspaces. Use agent chat for remote profiles.")); return;
     }
     const bool terminal = preset == "none" || preset.endsWith("-cli");
     QJsonObject descriptor{{"id", newId()}, {"workspaceId", m_workspaceId}, {"cwd", currentDirectory()},
         {"kind", terminal ? "terminal" : "agent"}, {"agentPreset", preset},
         {"title", preset == "none" ? "Konsole" : preset.startsWith("codex") ? "Codex" : "Claude"},
         {"permissionMode", "default"}};
+    if (terminal) {
+        const auto qt = m_settings["qtUi"].toObject();
+        QJsonObject terminalSettings;
+        for (const auto &key : {"terminalBackend", "terminalExecutable", "terminalArguments", "terminalCommandArguments", "konsoleProfile"})
+            if (qt.contains(key)) terminalSettings.insert(key, qt[key]);
+        descriptor.insert("terminalSettings", terminalSettings);
+        if (preset == "none" && qt["terminalBackend"] == "external")
+            descriptor.insert("title", QFileInfo(qt["terminalExecutable"].toString()).fileName());
+    }
     if (!terminal) {
         const bool codex = preset.startsWith("codex");
         const QString model = m_settings[codex ? "defaultCodexModel" : "defaultClaudeModel"].toString();
@@ -747,8 +756,11 @@ void MainWindow::createTab(const QJsonObject &descriptor, bool save) {
             // env resolves the user's installed CLI using PATH, without a shell command string.
             program = "/usr/bin/env"; arguments = {preset == "claude-cli" ? "claude" : "codex"};
         }
+        // Legacy descriptors always remain Konsole tabs. New descriptors save
+        // their own backend so a settings change cannot replace a live shell.
+        const auto terminalSettings = descriptor["terminalSettings"].toObject();
         auto *terminal = new TerminalPanel(descriptor["cwd"].toString(), program, arguments, tabs,
-            m_settings["qtUi"].toObject()["konsoleProfile"].toString());
+            terminalSettings["konsoleProfile"].toString(m_settings["qtUi"].toObject()["konsoleProfile"].toString()), terminalSettings);
         connect(terminal, &TerminalPanel::exited, this, [this, tabs, terminal] {
             if (m_closing) return;
             if (m_settings["closeTerminalAfterProcessExit"].toBool()) {
