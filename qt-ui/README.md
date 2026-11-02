@@ -117,6 +117,11 @@ delegates to an existing server may create a window BAT cannot manage.
 Closing a BAT tab stops the process group it started. Fonts, colors and shell
 settings for third-party apps are managed by those apps.
 
+Clicking or tabbing into an embedded terminal transfers keyboard focus to it;
+clicking a BAT control returns focus to BAT. Mouse selection and paste use the
+terminal app's own bindings. Modal dialogs keep focus when the terminal behind
+them is clicked.
+
 The Qt suite covers settings persistence, literal arguments, embedding,
 resize, restoration, process isolation and cleanup. To also exercise installed
 Ghostty and WezTerm on X11 (with an appropriate Qt/KDE runtime environment):
@@ -124,6 +129,10 @@ Ghostty and WezTerm on X11 (with an appropriate Qt/KDE runtime environment):
 ```sh
 QT_QPA_PLATFORM=xcb BAT_TEST_TERMINALS=wezterm,ghostty xvfb-run -a dist/qt-build/native/bat-qt-tests
 ```
+
+The WezTerm mouse test also requires the X11 XTEST library (`libxtst6` on
+Ubuntu/Kubuntu). It sends native input on the test display to check drag
+selection, PRIMARY/clipboard paste, focus changes and modal-dialog protection.
 
 **Git** switches to an embedded workspace view above the running terminal/agent
 sessions. Its three columns show commits (including uncommitted changes), changed

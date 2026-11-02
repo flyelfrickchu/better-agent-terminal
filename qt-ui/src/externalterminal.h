@@ -21,8 +21,12 @@ public:
     bool available() const;
 signals:
     void exited();
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
 private:
     void pollWindow();
+    void handleNativeEvents();
+    void focusTerminal(quint32 time);
     void fail(const QString &message);
     void stopProcess();
     struct Native;

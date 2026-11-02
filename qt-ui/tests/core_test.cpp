@@ -6,6 +6,9 @@
 #include "agentpanel.h"
 #include "settingsdialog.h"
 #include "gitpanel.h"
+#include "x11input.h"
+#include <QClipboard>
+#include <QScopeGuard>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
@@ -440,6 +443,96 @@ private slots:
         QFile request(directory.filePath("exit-terminal")); QVERIFY(request.open(QIODevice::WriteOnly)); request.close();
         QTRY_COMPARE_WITH_TIMEOUT(exited.count(), 1, 5000);
         QVERIFY(!panel->available());
+    }
+    void weztermMouseSelectionAndPaste() {
+        if (!qEnvironmentVariable("BAT_TEST_TERMINALS").split(',').contains("wezterm"))
+            QSKIP("Set BAT_TEST_TERMINALS=wezterm for native mouse/clipboard integration");
+        QVERIFY(ExternalTerminalPanel::platformError().isEmpty());
+        X11Input input;
+        QVERIFY2(input.available(), "X11 and XTEST are required for native input");
+        const int doubleClickInterval = QApplication::doubleClickInterval();
+        const auto restoreClickInterval = qScopeGuard([doubleClickInterval] {
+            QApplication::setDoubleClickInterval(doubleClickInterval);
+        });
+        // Ensure rapid returns to the same BAT field exercise Qt's distinct
+        // double-click event even if the foreign client handled intervening clicks.
+        QApplication::setDoubleClickInterval(2000);
+        QTemporaryDir directory;
+        QWidget window;
+        auto *layout = new QVBoxLayout(&window);
+        auto *edit = new QLineEdit(&window); layout->addWidget(edit);
+        const QJsonObject settings{{"terminalBackend", "external"}, {"terminalExecutable", "wezterm"},
+            {"terminalArguments", "--skip-config --config enable_wayland=false --config enable_tab_bar=false --config font_size=14 --config window_padding={left=0,right=0,top=0,bottom=0} start --always-new-process --cwd {cwd}"},
+            {"terminalCommandArguments", "-- {command}"}};
+        auto *panel = new TerminalPanel(directory.path(), "/bin/sh", {"-c",
+            "stty -echo -icanon; printf '\033[2J\033[HSELECT_ME\\n'; touch ready; dd bs=1 count=9 of=primary.txt 2>/dev/null; dd bs=1 count=14 of=clipboard.txt 2>/dev/null; dd bs=1 count=14 of=tab-paste.txt 2>/dev/null; while [ ! -e exit-terminal ]; do sleep 0.1; done"}, &window, {}, settings);
+        layout->addWidget(panel); window.resize(700, 400); window.show();
+        QTRY_VERIFY_WITH_TIMEOUT(panel->available(), 20000);
+        QTRY_VERIFY(QFile::exists(directory.filePath("ready")));
+        auto *container = panel->findChild<QWidget *>("externalTerminalContainer"); QVERIFY(container);
+        // Start with keyboard focus in BAT, as when returning from a toolbar,
+        // workspace tree or agent input. Mouse selection must transfer it back.
+        edit->setFocus(); input.focus(window.winId());
+        QTest::qWait(200);
+        input.move(container->mapToGlobal(QPoint(5, 12)));
+        input.press(1); QTest::qWait(50);
+        input.move(container->mapToGlobal(QPoint(110, 12)));
+        QTest::qWait(100); input.release(1);
+        QTRY_COMPARE_WITH_TIMEOUT(QApplication::clipboard()->text(QClipboard::Selection).trimmed(), QString("SELECT_ME"), 3000);
+        const auto terminalWindow = input.focusedWindow();
+        // Returning to BAT must restore native keyboard focus there as well.
+        input.move(edit->mapToGlobal(edit->rect().center())); input.press(1); input.release(1);
+        QTest::qWait(100);
+        input.keyEvent("a", true); input.keyEvent("a", false);
+        QTRY_COMPARE(edit->text(), QString("a"));
+        // Middle-click must focus and paste on the first click after leaving
+        // BAT's input field; clipboard delivery itself is asynchronous.
+        input.move(container->mapToGlobal(QPoint(40, 12)));
+        input.press(2); input.release(2);
+        QTRY_COMPARE_WITH_TIMEOUT(QFileInfo(directory.filePath("primary.txt")).size(), 9, 3000);
+        QFile primary(directory.filePath("primary.txt")); QVERIFY(primary.open(QIODevice::ReadOnly));
+        QCOMPARE(primary.readAll(), QByteArray("SELECT_ME"));
+        QApplication::clipboard()->setText("CLIPBOARD_TEXT");
+        input.keyEvent("Control_L", true); input.keyEvent("Shift_L", true);
+        input.keyEvent("v", true); input.keyEvent("v", false);
+        input.keyEvent("Shift_L", false); input.keyEvent("Control_L", false);
+        QTRY_COMPARE_WITH_TIMEOUT(QFileInfo(directory.filePath("clipboard.txt")).size(), 14, 3000);
+        QFile clipboard(directory.filePath("clipboard.txt")); QVERIFY(clipboard.open(QIODevice::ReadOnly));
+        QCOMPARE(clipboard.readAll(), QByteArray("CLIPBOARD_TEXT"));
+        QCOMPARE(edit->text(), QString("a"));
+        // Keyboard navigation back into the container needs the same native
+        // focus handoff as a click, without changing WezTerm's own key bindings.
+        edit->clear();
+        input.move(edit->mapToGlobal(edit->rect().center())); input.press(1); input.release(1);
+        QTest::qWait(100);
+        // Scrolling over the terminal is not a request to leave BAT's editor.
+        input.move(container->mapToGlobal(QPoint(40, 12))); QTest::qWait(100);
+        input.press(4); input.release(4);
+        QTest::qWait(100);
+        input.keyEvent("c", true); input.keyEvent("c", false);
+        QTRY_COMPARE(edit->text(), QString("c"));
+        input.keyEvent("Tab", true); input.keyEvent("Tab", false);
+        QTRY_COMPARE(input.focusedWindow(), terminalWindow);
+        input.keyEvent("Control_L", true); input.keyEvent("Shift_L", true);
+        input.keyEvent("v", true); input.keyEvent("v", false);
+        input.keyEvent("Shift_L", false); input.keyEvent("Control_L", false);
+        QTRY_COMPARE_WITH_TIMEOUT(QFileInfo(directory.filePath("tab-paste.txt")).size(), 14, 3000);
+        QFile tabPaste(directory.filePath("tab-paste.txt")); QVERIFY(tabPaste.open(QIODevice::ReadOnly));
+        QCOMPARE(tabPaste.readAll(), QByteArray("CLIPBOARD_TEXT"));
+        // A click behind an application-modal dialog must not focus the
+        // foreign client or be replayed into its terminal content.
+        QDialog dialog(&window);
+        auto *dialogLayout = new QVBoxLayout(&dialog);
+        auto *dialogEdit = new QLineEdit(&dialog); dialogLayout->addWidget(dialogEdit);
+        dialog.setWindowModality(Qt::ApplicationModal); dialog.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&dialog)); input.focus(dialog.winId());
+        QTRY_COMPARE(QApplication::activeModalWidget(), &dialog);
+        input.move(container->mapToGlobal(QPoint(40, 12))); input.press(1); input.release(1);
+        QTest::qWait(100);
+        QVERIFY(input.focusedWindow() != terminalWindow);
+        input.keyEvent("b", true); input.keyEvent("b", false);
+        QTRY_COMPARE(dialogEdit->text(), QString("b"));
+        dialog.close();
     }
     void legacyWorkspacesAppearUnderDefaultProject() {
         QTemporaryDir directory;

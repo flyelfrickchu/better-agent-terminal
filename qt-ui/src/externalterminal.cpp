@@ -7,6 +7,9 @@
 #include <QVBoxLayout>
 #include <QWindow>
 #include <QProcessEnvironment>
+#include <QApplication>
+#include <QEvent>
+#include <QSocketNotifier>
 #include <cstring>
 #ifdef BAT_HAVE_XCB
 #include <xcb/xcb.h>
@@ -35,7 +38,8 @@ struct ExternalTerminalPanel::Native {
     xcb_connection_t *connection = nullptr;
     xcb_window_t root = 0, window = 0;
     xcb_atom_t pid = 0, transient = 0, windowType = 0, normalType = 0;
-    ~Native() { if (connection) xcb_disconnect(connection); }
+    std::unique_ptr<QSocketNotifier> events;
+    ~Native() { events.reset(); if (connection) xcb_disconnect(connection); }
     xcb_atom_t atom(const char *name) {
         auto *reply = xcb_intern_atom_reply(connection,
             xcb_intern_atom(connection, false, uint16_t(strlen(name)), name), nullptr);
@@ -49,6 +53,19 @@ struct ExternalTerminalPanel::Native {
         if (reply && reply->format == 32 && xcb_get_property_value_length(reply) == 4)
             memcpy(&value, xcb_get_property_value(reply), sizeof(value));
         free(reply); return value;
+    }
+    bool needsHostFocus(xcb_window_t hostWindow) {
+        auto *focus = xcb_get_input_focus_reply(connection, xcb_get_input_focus(connection), nullptr);
+        xcb_window_t current = focus ? focus->focus : xcb_window_t(XCB_NONE);
+        free(focus);
+        if (current == hostWindow) return true;
+        for (int depth = 0; current > XCB_INPUT_FOCUS_POINTER_ROOT && current != root && depth < 32; ++depth) {
+            if (current == window) return true;
+            auto *tree = xcb_query_tree_reply(connection, xcb_query_tree(connection, current), nullptr);
+            const auto parent = tree ? tree->parent : xcb_window_t(XCB_NONE);
+            free(tree); current = parent;
+        }
+        return false;
     }
     xcb_window_t findWindow(xcb_window_t parent, qint64 group, int depth = 0) {
         if (depth > 4) return 0;
@@ -181,13 +198,73 @@ ExternalTerminalPanel::ExternalTerminalPanel(const QJsonObject &settings, const 
 }
 
 ExternalTerminalPanel::~ExternalTerminalPanel() {
+    qApp->removeEventFilter(this);
     m_poll.stop(); QObject::disconnect(&m_process, nullptr, this, nullptr);
+#ifdef BAT_HAVE_XCB
+    if (m_native->events) m_native->events->setEnabled(false);
+#endif
     stopProcess();
     // Release the foreign window wrapper before its X11 client/connection.
     delete m_container;
 }
 
 bool ExternalTerminalPanel::available() const { return !m_done && m_container; }
+
+void ExternalTerminalPanel::focusTerminal(quint32 time) {
+#ifdef BAT_HAVE_XCB
+    if (!available() || !isVisible() || !isEnabled() ||
+        QApplication::activeModalWidget() || QApplication::activePopupWidget()) return;
+    // Foreign clients do not necessarily implement XEmbed focus messages, and
+    // Qt's foreign-window wrapper cannot activate them reliably on X11.
+    xcb_set_input_focus(m_native->connection, XCB_INPUT_FOCUS_PARENT, m_native->window, time);
+    xcb_flush(m_native->connection);
+#else
+    Q_UNUSED(time);
+#endif
+}
+
+bool ExternalTerminalPanel::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == m_container && event->type() == QEvent::FocusIn) focusTerminal(0);
+#ifdef BAT_HAVE_XCB
+    else if (available() && isVisible() &&
+             (event->type() == QEvent::FocusIn || event->type() == QEvent::MouseButtonPress ||
+              event->type() == QEvent::MouseButtonDblClick)) {
+        auto *widget = qobject_cast<QWidget *>(watched);
+        if (widget && widget != this && !isAncestorOf(widget) && !widget->isAncestorOf(this) &&
+            m_native->needsHostFocus(widget->window()->winId())) {
+            // Qt does not track focus changes in a foreign client's window.
+            // Give the BAT control its own native focus target: focusing only
+            // the shared ancestor lets X11 route keys to the foreign child
+            // again whenever the pointer moves over that child.
+            widget->winId();
+            widget->windowHandle()->requestActivate();
+        }
+    }
+#endif
+    return QWidget::eventFilter(watched, event);
+}
+
+void ExternalTerminalPanel::handleNativeEvents() {
+#ifdef BAT_HAVE_XCB
+    while (auto *event = xcb_poll_for_event(m_native->connection)) {
+        if ((event->response_type & 0x7f) == XCB_BUTTON_PRESS) {
+            const auto *press = reinterpret_cast<xcb_button_press_event_t *>(event);
+            const bool accept = available() && isVisible() && isEnabled() &&
+                !QApplication::activeModalWidget() && !QApplication::activePopupWidget();
+            if (accept) {
+                m_container->setFocus(Qt::MouseFocusReason);
+                focusTerminal(press->time);
+            }
+            // Replay after focusing so the terminal receives the original
+            // press, drag and release, including modifiers and native grabs.
+            xcb_allow_events(m_native->connection,
+                accept ? XCB_ALLOW_REPLAY_POINTER : XCB_ALLOW_ASYNC_POINTER, press->time);
+            xcb_flush(m_native->connection);
+        }
+        free(event);
+    }
+#endif
+}
 
 void ExternalTerminalPanel::stopProcess() {
 #ifdef BAT_HAVE_XCB
@@ -205,6 +282,9 @@ void ExternalTerminalPanel::stopProcess() {
 
 void ExternalTerminalPanel::fail(const QString &message) {
     if (m_done) return;
+#ifdef BAT_HAVE_XCB
+    if (m_native->events) m_native->events->setEnabled(false);
+#endif
     m_done = true; m_poll.stop(); stopProcess();
     delete m_container; m_container = nullptr;
     m_status->setText(message); m_status->show();
@@ -226,6 +306,9 @@ void ExternalTerminalPanel::pollWindow() {
         } else if (m_native->findWindow(m_native->root, m_processGroup)) {
             fail(tr("The terminal opened multiple windows. Configure one window per process for BAT embedding, then reopen this tab."));
         }
+        // Synchronous XCB replies can move events from the socket into XCB's
+        // internal queue before QSocketNotifier observes readable data.
+        handleNativeEvents();
         return;
     }
     const auto window = m_native->findWindow(m_native->root, m_processGroup);
@@ -235,8 +318,28 @@ void ExternalTerminalPanel::pollWindow() {
         m_native->window = window;
         m_container = QWidget::createWindowContainer(foreign, this);
         m_container->setObjectName("externalTerminalContainer");
+        // Establish a native parent before embedding. Creating native BAT
+        // controls later must not place a Qt sibling over the foreign window.
+        m_container->setAttribute(Qt::WA_NativeWindow);
         m_container->setFocusPolicy(Qt::StrongFocus); setFocusProxy(m_container);
+        qApp->installEventFilter(this);
         layout()->addWidget(m_container); m_status->hide(); m_container->show();
+        // A passive synchronous grab lets us focus a foreign client before
+        // replaying the first click; selecting ButtonPress on another client's
+        // window would instead compete with that client's own input handling.
+        // Wheel events must keep the existing keyboard focus, as they do in
+        // other BAT views. Only actual mouse clicks request a focus transfer.
+        for (const auto button : {XCB_BUTTON_INDEX_1, XCB_BUTTON_INDEX_2, XCB_BUTTON_INDEX_3}) {
+            const auto grab = xcb_grab_button_checked(m_native->connection, false, window,
+                XCB_EVENT_MASK_BUTTON_PRESS, XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC,
+                XCB_NONE, XCB_NONE, button, XCB_MOD_MASK_ANY);
+            if (auto *error = xcb_request_check(m_native->connection, grab)) {
+                free(error); fail(tr("Cannot enable mouse focus for this terminal window.")); return;
+            }
+        }
+        m_native->events = std::make_unique<QSocketNotifier>(xcb_get_file_descriptor(m_native->connection), QSocketNotifier::Read, this);
+        connect(m_native->events.get(), &QSocketNotifier::activated, this, &ExternalTerminalPanel::handleNativeEvents);
+        handleNativeEvents();
         m_poll.setInterval(250);
     } else if (m_startTime.elapsed() > 15000 ||
                (m_process.state() == QProcess::NotRunning && m_process.exitCode() != 0)) {
