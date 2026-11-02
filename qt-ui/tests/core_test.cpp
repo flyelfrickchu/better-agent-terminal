@@ -671,7 +671,19 @@ private slots:
         QVERIFY(programOutput.open(QIODevice::ReadOnly));
         QCOMPARE(QString::fromUtf8(programOutput.readAll()).trimmed(), directory.path());
     }
+    void tlsProtocolAndLifecycle_data() {
+        QTest::addColumn<bool>("thirdPartyTerminal");
+        QTest::addColumn<QString>("thirdPartyExecutable");
+        QTest::newRow("konsole") << false << QString();
+        QTest::newRow("third-party-default") << true << QString();
+        for (const auto &name : qEnvironmentVariable("BAT_TEST_TERMINALS").split(',', Qt::SkipEmptyParts))
+            QTest::newRow(qPrintable("third-party-default-" + name)) << true << name;
+    }
     void tlsProtocolAndLifecycle() {
+        QFETCH(bool, thirdPartyTerminal);
+        QFETCH(QString, thirdPartyExecutable);
+        if (thirdPartyTerminal && !ExternalTerminalPanel::platformError().isEmpty())
+            QSKIP("Third-party project removal requires X11; run under Xvfb with QT_QPA_PLATFORM=xcb");
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
         const QString certPath = directory.path() + "/cert.pem";
@@ -941,8 +953,53 @@ private slots:
         QVERIFY(removedAgent);
         QTRY_VERIFY(removedAgent->busy());
         window.show();
-        const auto removeFromMenu = [&](int index, QMessageBox::StandardButton answer) {
+        QPointer<TerminalPanel> externalTerminal;
+        qint64 externalPid = 0;
+        if (thirdPartyTerminal) {
+            // Change the default, then open a tab through the normal UI path.
+            // Existing Konsole tabs must coexist with the third-party terminal.
+            auto settings = window.m_settings;
+            settings["qtUi"] = QJsonObject{{"terminalBackend", "external"},
+                {"terminalExecutable", "/usr/bin/env"},
+                {"terminalArguments", QString("\"LD_LIBRARY_PATH=%1\" \"QT_PLUGIN_PATH=%2\" \"%3\" --terminal-window-probe {cwd}")
+                    .arg(qEnvironmentVariable("LD_LIBRARY_PATH"), qEnvironmentVariable("QT_PLUGIN_PATH"), QCoreApplication::applicationFilePath())},
+                {"terminalCommandArguments", "-- {command}"}};
+            if (!thirdPartyExecutable.isEmpty()) {
+                auto terminalSettings = settings["qtUi"].toObject();
+                terminalSettings["terminalExecutable"] = thirdPartyExecutable;
+                terminalSettings["terminalArguments"] = (thirdPartyExecutable == "wezterm"
+                    ? QString("--config enable_wayland=false start --always-new-process --cwd {cwd} --")
+                    : QString("--gtk-single-instance=false --working-directory={cwd} -e"))
+                    + " /bin/sh -c \"echo $$ > project-terminal-pid.txt; while [ ! -e exit-terminal ]; do sleep 0.1; done\"";
+                settings["qtUi"] = terminalSettings;
+            }
+            window.applySettings(settings);
+            window.showWorkspace(existingWorkspace, false);
+            window.addTab("none");
+            externalTerminal = qobject_cast<TerminalPanel *>(tabs->widget(3));
+            QVERIFY(externalTerminal);
+            QTRY_VERIFY_WITH_TIMEOUT(externalTerminal->available(), 20000);
+            QFile probe(directory.filePath(thirdPartyExecutable.isEmpty() ? "terminal-probe.json" : "project-terminal-pid.txt"));
+            QTRY_VERIFY_WITH_TIMEOUT(probe.exists(), 5000);
+            QVERIFY(probe.open(QIODevice::ReadOnly));
+            const auto output = probe.readAll();
+            externalPid = thirdPartyExecutable.isEmpty()
+                ? QJsonDocument::fromJson(output).object()["pid"].toInteger() : output.trimmed().toLongLong();
+            QVERIFY(externalPid > 0);
+            QTRY_VERIFY(!window.m_saveInFlight);
+        }
+        const auto removeFromMenu = [&](int index, QMessageBox::StandardButton answer,
+                                        bool saveDuringConfirmation = false, bool saveBeforeAction = false) {
             bool found = false;
+            bool confirmed = false;
+            bool savePendingAtConfirmation = false;
+            QTimer answerTimer;
+            answerTimer.setSingleShot(true);
+            connect(&answerTimer, &QTimer::timeout, &window, [&] {
+                savePendingAtConfirmation = window.m_saveInFlight && !pendingWorkspaceReplies.isEmpty();
+                auto *dialog = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                if (dialog) { confirmed = true; dialog->button(answer)->click(); }
+            });
             auto *group = window.m_workspaces->topLevelItem(index);
             window.m_workspaces->scrollToItem(group);
             QTimer::singleShot(0, &window, [&] {
@@ -954,25 +1011,51 @@ private slots:
                 menu->close();
                 if (!remove) return;
                 found = true;
-                QTimer::singleShot(0, &window, [&, answer] {
-                    auto *dialog = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
-                    if (dialog) dialog->button(answer)->click();
-                });
+                if (saveBeforeAction) window.saveSnapshot();
+                if (saveDuringConfirmation) window.scheduleSnapshotSave();
+                answerTimer.start(saveDuringConfirmation ? 350 : 0);
                 remove->trigger();
             });
             window.m_workspaces->customContextMenuRequested(window.m_workspaces->visualItemRect(group).center());
-            return found;
+            return found && confirmed && (!saveDuringConfirmation || savePendingAtConfirmation);
         };
         QVERIFY2(removeFromMenu(0, QMessageBox::No), "Project context menu must offer Remove project");
+        delayWorkspaceSaves = true;
+        QVERIFY2(removeFromMenu(0, QMessageBox::No, false, true),
+                 "Remove project must open confirmation even while a selection save is pending");
+        QTRY_COMPARE(pendingWorkspaceReplies.size(), 1);
+        delayWorkspaceSaves = false;
+        releaseWorkspaceReply();
+        QTRY_VERIFY(!window.m_saveInFlight);
         QCOMPARE(window.m_snapshot["workspaces"].toArray(), removalWorkspaces);
         QCOMPARE(window.m_workspaces->topLevelItemCount(), 3);
         QVERIFY(terminal); QVERIFY(unsaved);
         QVERIFY(removedAgent); QVERIFY(stoppedSessions.isEmpty());
-        QVERIFY(removeFromMenu(0, QMessageBox::Yes));
+        if (thirdPartyTerminal) QVERIFY(externalTerminal && externalTerminal->available());
+        // A human can leave the menu/confirmation open beyond the autosave
+        // debounce. The confirmation must still remove the selected project,
+        // and the older save's reply must not resurrect its tabs or workspaces.
+        delayWorkspaceSaves = true;
+        QVERIFY(removeFromMenu(0, QMessageBox::Yes, true));
+        QCOMPARE(window.m_workspaces->topLevelItemCount(), 2);
+        QVERIFY(window.m_saveInFlight);
+        QCOMPARE(pendingWorkspaceReplies.size(), 1);
+        releaseWorkspaceReply();
+        QTRY_COMPARE(pendingWorkspaceReplies.size(), 1);
+        delayWorkspaceSaves = false;
+        releaseWorkspaceReply();
         QTRY_VERIFY(!window.m_saveInFlight);
         QTRY_COMPARE(window.m_workspaces->topLevelItemCount(), 2);
         QVERIFY(!terminal); QVERIFY(!unsaved);
         QVERIFY(!removedAgent);
+        if (thirdPartyTerminal) {
+            QVERIFY(!externalTerminal);
+            const auto processRunning = [&] {
+                QFile status(QString("/proc/%1/status").arg(externalPid));
+                return status.open(QIODevice::ReadOnly) && !status.readAll().contains("State:\tZ");
+            };
+            QTRY_VERIFY(!processRunning());
+        }
         QTRY_COMPARE(stoppedSessions, QStringList{"remove-agent"});
         QVERIFY(otherPanel);
         QVERIFY(!window.m_workspaceTabs.contains(existingWorkspace));

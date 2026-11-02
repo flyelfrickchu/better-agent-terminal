@@ -525,7 +525,7 @@ void MainWindow::renameProject() {
 }
 
 void MainWindow::removeProject() {
-    if (!hostReady() || m_loading || m_saveInFlight) return;
+    if (!hostReady() || m_loading) return;
     const QString id = m_projectId;
     const QString context = m_host.contextId();
     QJsonObject selected;
@@ -540,8 +540,10 @@ void MainWindow::removeProject() {
     confirmation.setDefaultButton(QMessageBox::No);
     if (confirmation.exec() != QMessageBox::Yes) return;
     // The modal dialog processes host events. Re-read current state and never
-    // apply a confirmation to another profile or an in-flight save.
-    if (!hostReady() || m_host.contextId() != context || m_loading || m_saveInFlight) return;
+    // apply a confirmation to another profile. Selection autosaves can start
+    // while the menu or dialog is open; saveSnapshot queues this removal after
+    // any pending save and prevents its older reply from restoring the project.
+    if (!hostReady() || m_host.contextId() != context || m_loading) return;
     auto qt = m_snapshot["qtUi"].toObject(); auto projects = qt["projects"].toArray();
     int index = -1;
     for (int i = 0; i < projects.size(); ++i)
