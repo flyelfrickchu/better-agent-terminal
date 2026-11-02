@@ -117,6 +117,13 @@ delegates to an existing server may create a window BAT cannot manage.
 Closing a BAT tab stops the process group it started. Fonts, colors and shell
 settings for third-party apps are managed by those apps.
 
+Window discovery and lifecycle checks share a worker with a separate X11
+connection. It uses the window manager's client list when available, bounded
+startup discovery otherwise, and window-change notifications after attachment.
+It does not repeatedly scan the desktop on the UI thread. The native suite
+checks responsiveness with 50,000 unrelated X11 windows, concurrent sessions,
+and windows that publish their PID after mapping.
+
 Clicking or tabbing into an embedded terminal transfers keyboard focus to it;
 clicking a BAT control returns focus to BAT. Mouse selection and paste use the
 terminal app's own bindings. Modal dialogs keep focus when the terminal behind

@@ -1,4 +1,5 @@
 #include "externalterminal.h"
+#include "x11windowwatcher.h"
 #include <QDir>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -10,7 +11,6 @@
 #include <QApplication>
 #include <QEvent>
 #include <QSocketNotifier>
-#include <cstring>
 #ifdef BAT_HAVE_XCB
 #include <xcb/xcb.h>
 #include <csignal>
@@ -37,23 +37,9 @@ struct ExternalTerminalPanel::Native {
 #ifdef BAT_HAVE_XCB
     xcb_connection_t *connection = nullptr;
     xcb_window_t root = 0, window = 0;
-    xcb_atom_t pid = 0, transient = 0, windowType = 0, normalType = 0;
+    quint64 watchToken = 0;
     std::unique_ptr<QSocketNotifier> events;
     ~Native() { events.reset(); if (connection) xcb_disconnect(connection); }
-    xcb_atom_t atom(const char *name) {
-        auto *reply = xcb_intern_atom_reply(connection,
-            xcb_intern_atom(connection, false, uint16_t(strlen(name)), name), nullptr);
-        const xcb_atom_t value = reply ? reply->atom : xcb_atom_t(XCB_ATOM_NONE);
-        free(reply); return value;
-    }
-    uint32_t property(xcb_window_t target, xcb_atom_t name, xcb_atom_t type) {
-        auto *reply = xcb_get_property_reply(connection,
-            xcb_get_property(connection, false, target, name, type, 0, 1), nullptr);
-        uint32_t value = 0;
-        if (reply && reply->format == 32 && xcb_get_property_value_length(reply) == 4)
-            memcpy(&value, xcb_get_property_value(reply), sizeof(value));
-        free(reply); return value;
-    }
     bool needsHostFocus(xcb_window_t hostWindow) {
         auto *focus = xcb_get_input_focus_reply(connection, xcb_get_input_focus(connection), nullptr);
         xcb_window_t current = focus ? focus->focus : xcb_window_t(XCB_NONE);
@@ -66,34 +52,6 @@ struct ExternalTerminalPanel::Native {
             free(tree); current = parent;
         }
         return false;
-    }
-    xcb_window_t findWindow(xcb_window_t parent, qint64 group, int depth = 0) {
-        if (depth > 4) return 0;
-        auto *tree = xcb_query_tree_reply(connection, xcb_query_tree(connection, parent), nullptr);
-        if (!tree) return 0;
-        xcb_window_t found = 0;
-        const auto *children = xcb_query_tree_children(tree);
-        for (int i = 0; i < xcb_query_tree_children_length(tree) && !found; ++i) {
-            const auto child = children[i];
-            if (child == window) continue;
-            const auto owner = property(child, pid, XCB_ATOM_CARDINAL);
-            // Match only the session we started. Never attach an existing
-            // terminal just because its class or executable name matches.
-            if (owner > 0 && ::getpgid(pid_t(owner)) == group) {
-                const auto type = property(child, windowType, XCB_ATOM_ATOM);
-                if ((type && type != normalType) || property(child, transient, XCB_ATOM_WINDOW)) continue;
-                auto *attributes = xcb_get_window_attributes_reply(connection,
-                    xcb_get_window_attributes(connection, child), nullptr);
-                if (attributes && attributes->map_state == XCB_MAP_STATE_VIEWABLE &&
-                    !attributes->override_redirect &&
-                    attributes->_class == XCB_WINDOW_CLASS_INPUT_OUTPUT) found = child;
-                free(attributes);
-            }
-            // WM decoration frames have no PID. Do not walk every widget in
-            // unrelated applications (especially over a remote X11 display).
-            if (!found && !owner) found = findWindow(child, group, depth + 1);
-        }
-        free(tree); return found;
     }
 #endif
 };
@@ -168,10 +126,16 @@ ExternalTerminalPanel::ExternalTerminalPanel(const QJsonObject &settings, const 
     for (int i = 0; i < screenNumber && screen.rem; ++i) xcb_screen_next(&screen);
     if (!screen.rem) { m_done = true; m_status->setText(tr("X11 screen is unavailable.")); return; }
     m_native->root = screen.data->root;
-    m_native->pid = m_native->atom("_NET_WM_PID");
-    m_native->transient = m_native->atom("WM_TRANSIENT_FOR");
-    m_native->windowType = m_native->atom("_NET_WM_WINDOW_TYPE");
-    m_native->normalType = m_native->atom("_NET_WM_WINDOW_TYPE_NORMAL");
+    auto *watcher = X11WindowWatcher::instance();
+    connect(watcher, &X11WindowWatcher::windowFound, this, [this](quint64 token, quint32 window) {
+        if (!m_done && token == m_native->watchToken) embedWindow(window);
+    });
+    connect(watcher, &X11WindowWatcher::windowClosed, this, [this](quint64 token) {
+        if (!m_done && token == m_native->watchToken) terminalExited();
+    });
+    connect(watcher, &X11WindowWatcher::failed, this, [this](quint64 token, const QString &message) {
+        if (!m_done && token == m_native->watchToken) fail(message);
+    });
     m_process.setChildProcessModifier([] { ::setsid(); });
 #endif
     auto environment = QProcessEnvironment::systemEnvironment();
@@ -191,7 +155,10 @@ ExternalTerminalPanel::ExternalTerminalPanel(const QJsonObject &settings, const 
         if (error == QProcess::FailedToStart) fail(tr("Cannot start terminal: %1").arg(m_process.errorString()));
     });
     connect(&m_process, &QProcess::started, this, [this] {
-        m_processGroup = m_process.processId(); m_startTime.start(); m_poll.start(50);
+        m_processGroup = m_process.processId(); m_startTime.start(); m_poll.start(250);
+#ifdef BAT_HAVE_XCB
+        m_native->watchToken = X11WindowWatcher::instance()->watchProcess(m_processGroup);
+#endif
     });
     connect(&m_poll, &QTimer::timeout, this, &ExternalTerminalPanel::pollWindow);
     m_process.start(executable, launchArguments);
@@ -202,6 +169,10 @@ ExternalTerminalPanel::~ExternalTerminalPanel() {
     m_poll.stop(); QObject::disconnect(&m_process, nullptr, this, nullptr);
 #ifdef BAT_HAVE_XCB
     if (m_native->events) m_native->events->setEnabled(false);
+    if (m_native->watchToken) {
+        X11WindowWatcher::instance()->unwatchProcess(m_native->watchToken);
+        m_native->watchToken = 0;
+    }
 #endif
     stopProcess();
     // Release the foreign window wrapper before its X11 client/connection.
@@ -239,6 +210,10 @@ bool ExternalTerminalPanel::eventFilter(QObject *watched, QEvent *event) {
             widget->winId();
             widget->windowHandle()->requestActivate();
         }
+        // Focus replies may already have pulled a grabbed click into XCB's
+        // internal queue. Release/replay it on the next GUI turn even when
+        // the socket no longer looks readable; discovery has no polling timer.
+        QTimer::singleShot(0, this, &ExternalTerminalPanel::handleNativeEvents);
     }
 #endif
     return QWidget::eventFilter(watched, event);
@@ -284,6 +259,10 @@ void ExternalTerminalPanel::fail(const QString &message) {
     if (m_done) return;
 #ifdef BAT_HAVE_XCB
     if (m_native->events) m_native->events->setEnabled(false);
+    if (m_native->watchToken) {
+        X11WindowWatcher::instance()->unwatchProcess(m_native->watchToken);
+        m_native->watchToken = 0;
+    }
 #endif
     m_done = true; m_poll.stop(); stopProcess();
     delete m_container; m_container = nullptr;
@@ -295,56 +274,57 @@ void ExternalTerminalPanel::pollWindow() {
 #ifdef BAT_HAVE_XCB
     if (m_done) return;
     if (xcb_connection_has_error(m_native->connection)) { fail(tr("The X11 display disconnected.")); return; }
-    if (m_native->window) {
-        auto *reply = xcb_get_geometry_reply(m_native->connection,
-            xcb_get_geometry(m_native->connection, m_native->window), nullptr);
-        const bool exists = reply; free(reply);
-        if (!exists) {
-            m_done = true; m_poll.stop(); stopProcess();
-            delete m_container; m_container = nullptr;
-            m_status->setText(tr("Terminal exited.")); m_status->show(); emit exited();
-        } else if (m_native->findWindow(m_native->root, m_processGroup)) {
-            fail(tr("The terminal opened multiple windows. Configure one window per process for BAT embedding, then reopen this tab."));
-        }
-        // Synchronous XCB replies can move events from the socket into XCB's
-        // internal queue before QSocketNotifier observes readable data.
-        handleNativeEvents();
-        return;
-    }
-    const auto window = m_native->findWindow(m_native->root, m_processGroup);
-    if (window) {
-        auto *foreign = QWindow::fromWinId(WId(window));
-        if (!foreign) { fail(tr("This terminal window cannot be embedded.")); return; }
-        m_native->window = window;
-        m_container = QWidget::createWindowContainer(foreign, this);
-        m_container->setObjectName("externalTerminalContainer");
-        // Establish a native parent before embedding. Creating native BAT
-        // controls later must not place a Qt sibling over the foreign window.
-        m_container->setAttribute(Qt::WA_NativeWindow);
-        m_container->setFocusPolicy(Qt::StrongFocus); setFocusProxy(m_container);
-        qApp->installEventFilter(this);
-        layout()->addWidget(m_container); m_status->hide(); m_container->show();
-        // A passive synchronous grab lets us focus a foreign client before
-        // replaying the first click; selecting ButtonPress on another client's
-        // window would instead compete with that client's own input handling.
-        // Wheel events must keep the existing keyboard focus, as they do in
-        // other BAT views. Only actual mouse clicks request a focus transfer.
-        for (const auto button : {XCB_BUTTON_INDEX_1, XCB_BUTTON_INDEX_2, XCB_BUTTON_INDEX_3}) {
-            const auto grab = xcb_grab_button_checked(m_native->connection, false, window,
-                XCB_EVENT_MASK_BUTTON_PRESS, XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC,
-                XCB_NONE, XCB_NONE, button, XCB_MOD_MASK_ANY);
-            if (auto *error = xcb_request_check(m_native->connection, grab)) {
-                free(error); fail(tr("Cannot enable mouse focus for this terminal window.")); return;
-            }
-        }
-        m_native->events = std::make_unique<QSocketNotifier>(xcb_get_file_descriptor(m_native->connection), QSocketNotifier::Read, this);
-        connect(m_native->events.get(), &QSocketNotifier::activated, this, &ExternalTerminalPanel::handleNativeEvents);
-        handleNativeEvents();
-        m_poll.setInterval(250);
-    } else if (m_startTime.elapsed() > 15000 ||
+    if (m_startTime.elapsed() > 15000 ||
                (m_process.state() == QProcess::NotRunning && m_process.exitCode() != 0)) {
         fail(tr("No embeddable X11 terminal window appeared. Use a new-process option and an X11-capable terminal.\n%1")
             .arg(QString::fromLocal8Bit(m_output).trimmed()));
     }
 #endif
+}
+
+void ExternalTerminalPanel::embedWindow(quint32 window) {
+#ifdef BAT_HAVE_XCB
+    if (m_container) return;
+    auto *foreign = QWindow::fromWinId(WId(window));
+    if (!foreign) { fail(tr("This terminal window cannot be embedded.")); return; }
+    m_native->window = window;
+    m_container = QWidget::createWindowContainer(foreign, this);
+    m_container->setObjectName("externalTerminalContainer");
+    // Establish a native parent before embedding. Creating native BAT
+    // controls later must not place a Qt sibling over the foreign window.
+    m_container->setAttribute(Qt::WA_NativeWindow);
+    m_container->setFocusPolicy(Qt::StrongFocus); setFocusProxy(m_container);
+    qApp->installEventFilter(this);
+    layout()->addWidget(m_container); m_status->hide(); m_container->show();
+    // A passive synchronous grab lets us focus a foreign client before
+    // replaying the first click; selecting ButtonPress on another client's
+    // window would instead compete with that client's own input handling.
+    // Wheel events must keep the existing keyboard focus, as they do in
+    // other BAT views. Only actual mouse clicks request a focus transfer.
+    for (const auto button : {XCB_BUTTON_INDEX_1, XCB_BUTTON_INDEX_2, XCB_BUTTON_INDEX_3}) {
+        const auto grab = xcb_grab_button_checked(m_native->connection, false, window,
+            XCB_EVENT_MASK_BUTTON_PRESS, XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC,
+            XCB_NONE, XCB_NONE, button, XCB_MOD_MASK_ANY);
+        if (auto *error = xcb_request_check(m_native->connection, grab)) {
+            free(error); fail(tr("Cannot enable mouse focus for this terminal window.")); return;
+        }
+    }
+    m_native->events = std::make_unique<QSocketNotifier>(xcb_get_file_descriptor(m_native->connection), QSocketNotifier::Read, this);
+    connect(m_native->events.get(), &QSocketNotifier::activated, this, &ExternalTerminalPanel::handleNativeEvents);
+    handleNativeEvents();
+    m_poll.stop();
+#else
+    Q_UNUSED(window);
+#endif
+}
+
+void ExternalTerminalPanel::terminalExited() {
+#ifdef BAT_HAVE_XCB
+    if (m_native->events) m_native->events->setEnabled(false);
+    X11WindowWatcher::instance()->unwatchProcess(m_native->watchToken);
+    m_native->watchToken = 0;
+#endif
+    m_done = true; m_poll.stop(); stopProcess();
+    delete m_container; m_container = nullptr;
+    m_status->setText(tr("Terminal exited.")); m_status->show(); emit exited();
 }

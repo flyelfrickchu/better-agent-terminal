@@ -48,6 +48,7 @@ add_library(bat-qt-core STATIC
     src/transcript.cpp src/transcript.h
     src/terminalpanel.cpp src/terminalpanel.h
     src/externalterminal.cpp src/externalterminal.h
+    src/x11windowwatcher.cpp src/x11windowwatcher.h
     src/settingsdialog.cpp src/settingsdialog.h
     src/gitpanel.cpp src/gitpanel.h
 )

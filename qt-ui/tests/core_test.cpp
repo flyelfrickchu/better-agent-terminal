@@ -2,6 +2,7 @@
 #include "transcript.h"
 #include "terminalpanel.h"
 #include "externalterminal.h"
+#include "x11windowwatcher.h"
 #include "mainwindow.h"
 #include "agentpanel.h"
 #include "settingsdialog.h"
@@ -311,7 +312,15 @@ private slots:
         QVERIFY(!ExternalTerminalPanel::validate(settings).isEmpty());
         QVERIFY(!QFileInfo::exists(base.filePath("injected")));
     }
+    void thirdPartyWindowEmbedsResizesRestoresAndCleansUp_data() {
+        QTest::addColumn<QString>("startup");
+        QTest::newRow("pid-before-map") << QString();
+        QTest::newRow("pid-after-map") << QString("late-pid");
+        QTest::newRow("type-after-map") << QString("late-type");
+        QTest::newRow("transient-after-map") << QString("late-transient");
+    }
     void thirdPartyWindowEmbedsResizesRestoresAndCleansUp() {
+        QFETCH(QString, startup);
         if (QGuiApplication::platformName() != "xcb" || !ExternalTerminalPanel::platformError().isEmpty())
             QSKIP("Requires the X11 backend; run under Xvfb with QT_QPA_PLATFORM=xcb");
         QTemporaryDir directory;
@@ -325,7 +334,7 @@ private slots:
             .arg(qEnvironmentVariable("LD_LIBRARY_PATH"), qEnvironmentVariable("QT_PLUGIN_PATH"), QCoreApplication::applicationFilePath());
         const QJsonObject configuration{{"terminalBackend", "external"},
             {"terminalExecutable", "/usr/bin/env"},
-            {"terminalArguments", probeArguments + " temporary-splash"},
+            {"terminalArguments", probeArguments + " temporary-splash " + startup},
             {"terminalCommandArguments", "-- {command}"}};
         const QJsonObject descriptor{{"id", "third-party"}, {"kind", "terminal"},
             {"workspaceId", "workspace"}, {"cwd", directory.path()}, {"terminalSettings", configuration}};
@@ -396,6 +405,68 @@ private slots:
         QFile file(directory.filePath("terminal-probe.json")); QVERIFY(file.open(QIODevice::ReadOnly));
         const auto pid = QJsonDocument::fromJson(file.readAll()).object()["pid"].toInteger();
         QVERIFY(pid > 0); QTRY_VERIFY(!QFileInfo::exists(QString("/proc/%1").arg(pid)));
+    }
+    void thirdPartyTerminalKeepsUiResponsiveOnBusyDisplay() {
+        if (QGuiApplication::platformName() != "xcb" || !ExternalTerminalPanel::platformError().isEmpty())
+            QSKIP("Requires X11");
+        X11Input noise;
+        QVERIFY(noise.createUnmappedWindows(50000));
+        QTemporaryDir directory;
+        QElapsedTimer elapsed; elapsed.start();
+        qint64 longest = 0; int ticks = 0;
+        QTimer heartbeat;
+        connect(&heartbeat, &QTimer::timeout, this, [&] {
+            longest = qMax(longest, elapsed.restart()); ++ticks;
+        });
+        heartbeat.start(10);
+        const auto arguments = QString("\"LD_LIBRARY_PATH=%1\" \"QT_PLUGIN_PATH=%2\" \"%3\" --terminal-window-probe {cwd} requested-extra-window requested-native-child")
+            .arg(qEnvironmentVariable("LD_LIBRARY_PATH"), qEnvironmentVariable("QT_PLUGIN_PATH"), QCoreApplication::applicationFilePath());
+        TerminalPanel panel(directory.path(), {}, {}, nullptr, {}, {{"terminalBackend", "external"},
+            {"terminalExecutable", "/usr/bin/env"}, {"terminalArguments", arguments},
+            {"terminalCommandArguments", "-e {command}"}});
+        panel.resize(640, 480); panel.show();
+        QTRY_VERIFY_WITH_TIMEOUT(panel.available(), 10000);
+        QFile childRequest(directory.filePath("native-child")); QVERIFY(childRequest.open(QIODevice::WriteOnly)); childRequest.close();
+        // Generate subsequent desktop traffic outside the measured GUI thread.
+        // Otherwise XSync in the fixture itself would count as an app stall.
+        auto traffic = std::unique_ptr<QThread>(QThread::create([] {
+            X11Input other;
+            other.createUnmappedWindows(1000);
+            QThread::msleep(500);
+        }));
+        traffic->start();
+        QTest::qWait(1500);
+        heartbeat.stop();
+        traffic->wait();
+        qInfo("Busy X11 display: longest GUI heartbeat gap %lld ms, %d ticks", static_cast<long long>(longest), ticks);
+        QVERIFY2(longest < 150, qPrintable(QString("GUI blocked for %1 ms by terminal discovery").arg(longest)));
+        QVERIFY(ticks > 50);
+        QVERIFY(panel.available());
+        QFile request(directory.filePath("extra-window")); QVERIFY(request.open(QIODevice::WriteOnly)); request.close();
+        const auto *status = panel.findChild<QLabel *>("externalTerminalStatus"); QVERIFY(status);
+        QTRY_VERIFY_WITH_TIMEOUT(status->text().contains("multiple windows"), 5000);
+        QVERIFY(!panel.available());
+    }
+    void thirdPartySessionsShareWatcherAndExitIndependently() {
+        if (QGuiApplication::platformName() != "xcb" || !ExternalTerminalPanel::platformError().isEmpty())
+            QSKIP("Requires X11");
+        QTemporaryDir firstDirectory, secondDirectory;
+        const auto arguments = QString("\"LD_LIBRARY_PATH=%1\" \"QT_PLUGIN_PATH=%2\" \"%3\" --terminal-window-probe {cwd}")
+            .arg(qEnvironmentVariable("LD_LIBRARY_PATH"), qEnvironmentVariable("QT_PLUGIN_PATH"), QCoreApplication::applicationFilePath());
+        const QJsonObject settings{{"terminalBackend", "external"}, {"terminalExecutable", "/usr/bin/env"},
+            {"terminalArguments", arguments}, {"terminalCommandArguments", "-e {command}"}};
+        TerminalPanel first(firstDirectory.path(), {}, {}, nullptr, {}, settings);
+        TerminalPanel second(secondDirectory.path(), {}, {}, nullptr, {}, settings);
+        first.show(); second.show();
+        QTRY_VERIFY_WITH_TIMEOUT(first.available() && second.available(), 5000);
+        QCOMPARE(qApp->findChildren<X11WindowWatcher *>().size(), 1);
+        QSignalSpy firstExit(&first, &TerminalPanel::exited), secondExit(&second, &TerminalPanel::exited);
+        QFile request(firstDirectory.filePath("exit-terminal")); QVERIFY(request.open(QIODevice::WriteOnly)); request.close();
+        QTRY_COMPARE_WITH_TIMEOUT(firstExit.count(), 1, 5000);
+        QVERIFY(!first.available()); QVERIFY(second.available()); QCOMPARE(secondExit.count(), 0);
+        QFile secondRequest(secondDirectory.filePath("exit-terminal")); QVERIFY(secondRequest.open(QIODevice::WriteOnly)); secondRequest.close();
+        QTRY_COMPARE_WITH_TIMEOUT(secondExit.count(), 1, 5000);
+        QVERIFY(!second.available());
     }
     void installedThirdPartyTerminal_data() {
         QTest::addColumn<QString>("name");
@@ -1239,8 +1310,39 @@ int main(int argc, char **argv) {
             auto *extra = new QWidget; extra->setAttribute(Qt::WA_DeleteOnClose);
             QTimer::singleShot(500, extra, &QWidget::show);
         }
-        layout->addWidget(new QLineEdit(&window)); window.resize(300, 200); window.show();
+        bool extraShown = false, childShown = false;
+        layout->addWidget(new QLineEdit(&window)); window.resize(300, 200);
+        X11Input native;
+        if (app.arguments().contains("late-pid")) {
+            if (!native.setProcessId(window.winId(), 0)) return 14;
+            QTimer::singleShot(350, &window, [&] { native.setProcessId(window.winId(), QCoreApplication::applicationPid()); });
+        }
+        if (app.arguments().contains("late-type")) {
+            if (!native.setWindowType(window.winId(), "_NET_WM_WINDOW_TYPE_SPLASH")) return 15;
+            QTimer::singleShot(350, &window, [&] { native.setWindowType(window.winId(), "_NET_WM_WINDOW_TYPE_NORMAL"); });
+        }
+        if (app.arguments().contains("late-transient")) {
+            if (!native.setTransientFor(window.winId(), window.winId())) return 16;
+            QTimer::singleShot(350, &window, [&] { native.setTransientFor(window.winId(), 0); });
+        }
+        window.show();
+        if (app.arguments().contains("late-type") || app.arguments().contains("late-transient")) {
+            QTimer::singleShot(100, &window, [&] {
+                auto *child = new QWidget(&window);
+                child->setAttribute(Qt::WA_NativeWindow); child->show();
+            });
+        }
         const auto record = [&] {
+            if (!childShown && app.arguments().contains("requested-native-child") &&
+                QFileInfo::exists(QString::fromLocal8Bit(argv[2]) + "/native-child")) {
+                childShown = true;
+                auto *child = new QWidget(&window); child->setAttribute(Qt::WA_NativeWindow); child->show();
+            }
+            if (!extraShown && app.arguments().contains("requested-extra-window") &&
+                QFileInfo::exists(QString::fromLocal8Bit(argv[2]) + "/extra-window")) {
+                extraShown = true;
+                auto *extra = new QWidget; extra->setAttribute(Qt::WA_DeleteOnClose); extra->show();
+            }
             QProcess info;
             info.start("xwininfo", {"-id", QString::number(window.winId()), "-tree"});
             info.waitForFinished(500);

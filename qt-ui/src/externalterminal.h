@@ -25,6 +25,8 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 private:
     void pollWindow();
+    void embedWindow(quint32 window);
+    void terminalExited();
     void handleNativeEvents();
     void focusTerminal(quint32 time);
     void fail(const QString &message);
