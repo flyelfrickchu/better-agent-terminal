@@ -28,10 +28,12 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QToolButton>
 #include <QSettings>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -41,54 +43,244 @@
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QUuid>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
+#include <array>
 #include <functional>
+#include <optional>
 #include <utility>
 
 namespace {
 QString newId() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
 
-class WorkspaceProjectTree final : public QTreeWidget {
+class ProjectMoveAnimation final : public QWidget {
 public:
-    WorkspaceProjectTree(QWidget *parent, std::function<void(const QString &, int)> moveProject)
-        : QTreeWidget(parent), m_moveProject(std::move(moveProject)) {
-        setDragDropMode(InternalMove);
-        setDropIndicatorShown(true);
+    struct Block { QRect before; QRect after; };
+
+    explicit ProjectMoveAnimation(QWidget *viewport) : QWidget(viewport) {
+        setObjectName("project-move-animation");
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        hide();
+        m_progress.setDuration(180);
+        m_progress.setStartValue(0.0);
+        m_progress.setEndValue(1.0);
+        m_progress.setEasingCurve(QEasingCurve::OutCubic);
+        connect(&m_progress, &QVariantAnimation::valueChanged, this, [this] { update(); });
+        connect(&m_progress, &QVariantAnimation::finished, this, &ProjectMoveAnimation::clear);
+    }
+
+    void play(QPixmap before, QPixmap after, const std::array<Block, 2> &blocks) {
+        m_before = std::move(before);
+        m_after = std::move(after);
+        m_blocks = blocks;
+        setGeometry(parentWidget()->rect());
+        raise();
+        show();
+        m_progress.start();
+    }
+
+    void clear() {
+        m_progress.stop();
+        hide();
+        m_before = {};
+        m_after = {};
     }
 
 protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter painter(this);
+        QRect affected;
+        for (const auto &block : m_blocks) affected = affected.united(block.before).united(block.after);
+        painter.setClipRect(affected);
+        painter.fillRect(affected, palette().base());
+        const qreal progress = m_progress.currentValue().toReal();
+        for (const auto &block : m_blocks) {
+            const int y = qRound(block.before.top() + (block.after.top() - block.before.top()) * progress);
+            painter.save();
+            painter.setClipRect(block.after.translated(0, y - block.after.top()), Qt::IntersectClip);
+            // The two captures cover rows clipped by the viewport at either end of the move.
+            painter.drawPixmap(0, y - block.before.top(), m_before);
+            painter.drawPixmap(0, y - block.after.top(), m_after);
+            painter.restore();
+        }
+    }
+
+private:
+    QVariantAnimation m_progress;
+    QPixmap m_before, m_after;
+    std::array<Block, 2> m_blocks;
+};
+
+class WorkspaceProjectTree final : public QTreeWidget {
+public:
+    WorkspaceProjectTree(QWidget *parent, std::function<bool(const QString &, int)> moveProject)
+        : QTreeWidget(parent), m_moveProject(std::move(moveProject)),
+          m_animation(new ProjectMoveAnimation(viewport())) {
+        setDragDropMode(InternalMove);
+        setDropIndicatorShown(false);
+    }
+
+protected:
+    void reset() override {
+        setDragPosition(std::nullopt);
+        m_animation->clear();
+        QTreeWidget::reset();
+    }
+
     void startDrag(Qt::DropActions) override {
         auto *project = currentItem();
         if (!project || project->parent() || topLevelItemCount() < 2) return;
+        m_animation->clear();
+        m_draggedProject = indexFromItem(project);
         auto *data = mimeData({project});
         data->setData(projectIdFormat, project->data(0, Qt::UserRole).toString().toUtf8());
         auto *drag = new QDrag(this);
         drag->setMimeData(data);
+        drag->setPixmap(projectPreview(project));
+        drag->setHotSpot(QPoint(-12, -8));
         drag->exec(Qt::MoveAction);
+        m_draggedProject = QPersistentModelIndex();
+        setDragPosition(std::nullopt);
+    }
+
+    void dragMoveEvent(QDragMoveEvent *event) override {
+        if (!isProjectDrag(event)) {
+            event->ignore();
+            return;
+        }
+        QTreeWidget::dragMoveEvent(event); // Keep the view's edge auto-scroll active.
+        const QPoint point = event->position().toPoint();
+        setDragPosition(point);
+        event->setDropAction(Qt::MoveAction);
+        event->setAccepted(m_guideY >= 0);
+    }
+
+    void dragLeaveEvent(QDragLeaveEvent *event) override {
+        setDragPosition(std::nullopt);
+        QTreeWidget::dragLeaveEvent(event);
     }
 
     void dropEvent(QDropEvent *event) override {
-        const auto position = dropIndicatorPosition();
-        auto *target = itemAt(event->position().toPoint());
+        const auto location = isProjectDrag(event) ? dropLocation(event->position().toPoint()) : DropLocation{};
         // Clear Qt's drag state without letting the tree model reparent items.
         QDragLeaveEvent leave;
-        QTreeWidget::dragLeaveEvent(&leave);
+        dragLeaveEvent(&leave);
         event->ignore();
-        if (event->source() != this || !event->mimeData()->hasFormat(projectIdFormat)) return;
+        if (location.index < 0) return;
 
-        int index = topLevelItemCount();
-        if (target) {
-            if (target->parent() || (position != AboveItem && position != BelowItem)) return;
-            index = indexOfTopLevelItem(target) + (position == BelowItem ? 1 : 0);
-        }
-        m_moveProject(QString::fromUtf8(event->mimeData()->data(projectIdFormat)), index);
+        const int from = m_draggedProject.row();
+        const int to = location.index > from ? location.index - 1 : location.index;
+        const int firstShifted = from < to ? from + 1 : to;
+        const int lastShifted = from < to ? to : from - 1;
+        const int shift = from < to ? -1 : 1;
+        const QRect movedBefore = projectRows(from, from);
+        const QRect shiftedBefore = projectRows(firstShifted, lastShifted);
+        auto before = viewport()->grab();
+        const int scrollPosition = verticalScrollBar()->value();
+        if (!m_moveProject(QString::fromUtf8(event->mimeData()->data(projectIdFormat)), location.index)) return;
+        doItemsLayout();
+        verticalScrollBar()->setValue(scrollPosition);
+        m_animation->play(std::move(before), viewport()->grab(), {{
+            {shiftedBefore, projectRows(firstShifted + shift, lastShifted + shift)},
+            {movedBefore, projectRows(to, to)},
+        }});
         event->setDropAction(Qt::MoveAction);
         event->accept();
     }
 
+    void scrollContentsBy(int dx, int dy) override {
+        m_animation->clear();
+        QTreeWidget::scrollContentsBy(dx, dy);
+        if (m_dragPosition) {
+            setDragPosition(m_dragPosition);
+            viewport()->update();
+        }
+    }
+
+    void resizeEvent(QResizeEvent *event) override {
+        m_animation->clear();
+        QTreeWidget::resizeEvent(event);
+        if (m_dragPosition) setDragPosition(m_dragPosition);
+    }
+
+    void paintEvent(QPaintEvent *event) override {
+        QTreeWidget::paintEvent(event);
+        if (m_guideY < 0) return;
+        QPainter painter(viewport());
+        painter.fillRect(QRect(4, m_guideY - 1, viewport()->width() - 8, 3), palette().highlight());
+    }
+
 private:
+    struct DropLocation { int index = -1; int y = -1; };
+
+    bool isProjectDrag(const QDropEvent *event) const {
+        return m_draggedProject.isValid() && event->source() == this &&
+            event->mimeData()->hasFormat(projectIdFormat);
+    }
+
+    QRect projectRows(int first, int last) const {
+        const auto *end = topLevelItem(last);
+        if (end->isExpanded() && end->childCount()) end = end->child(end->childCount() - 1);
+        const int top = visualItemRect(topLevelItem(first)).top();
+        const int bottom = visualItemRect(end).bottom();
+        return QRect(0, top, viewport()->width(), bottom - top + 1);
+    }
+
+    DropLocation dropLocation(const QPoint &point) const {
+        if (!m_draggedProject.isValid() || !viewport()->rect().contains(point)) return {};
+        auto *target = itemAt(point);
+        const bool below = !target || target->parent() || point.y() > visualItemRect(target).center().y();
+        if (target && target->parent()) target = target->parent();
+        const int row = target ? indexOfTopLevelItem(target) : topLevelItemCount() - 1;
+        const int index = row + (below ? 1 : 0);
+        const int from = m_draggedProject.row();
+        if (index == from || index == from + 1) return {};
+        const QRect rows = projectRows(row, row);
+        const int y = below ? rows.bottom() + 1 : rows.top();
+        return {index, qBound(1, y, qMax(1, viewport()->height() - 2))};
+    }
+
+    void setDragPosition(std::optional<QPoint> point) {
+        m_dragPosition = point;
+        const int y = point ? dropLocation(*point).y : -1;
+        if (m_guideY == y) return;
+        m_guideY = y;
+        viewport()->update();
+    }
+
+    QPixmap projectPreview(const QTreeWidgetItem *project) const {
+        constexpr int padding = 8;
+        constexpr int iconSize = 16;
+        const QFont font = project->font(1).resolve(this->font());
+        const QFontMetrics metrics(font);
+        const QString name = metrics.elidedText(project->text(1), Qt::ElideMiddle,
+            qMax(96, viewport()->width() - iconSize - padding * 3));
+        const QSize size(metrics.horizontalAdvance(name) + iconSize + padding * 3,
+                         qMax(metrics.height(), iconSize) + padding * 2);
+        const qreal scale = devicePixelRatioF();
+        QPixmap preview(size * scale);
+        preview.setDevicePixelRatio(scale);
+        preview.fill(Qt::transparent);
+        QPainter painter(&preview);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(palette().highlight());
+        painter.drawRoundedRect(QRect(QPoint(), size), 5, 5);
+        const QIcon icon = project->icon(1).isNull() ? style()->standardIcon(QStyle::SP_DirIcon) : project->icon(1);
+        icon.paint(&painter, QRect(padding, (size.height() - iconSize) / 2, iconSize, iconSize));
+        painter.setFont(font);
+        painter.setPen(palette().highlightedText().color());
+        painter.drawText(QRect(padding * 2 + iconSize, 0, metrics.horizontalAdvance(name), size.height()),
+                         Qt::AlignVCenter | Qt::AlignLeft, name);
+        return preview;
+    }
+
     static constexpr auto projectIdFormat = "application/x-bat-project-id";
-    std::function<void(const QString &, int)> m_moveProject;
+    std::function<bool(const QString &, int)> m_moveProject;
+    ProjectMoveAnimation *m_animation;
+    QPersistentModelIndex m_draggedProject;
+    std::optional<QPoint> m_dragPosition;
+    int m_guideY = -1;
 };
 }
 
@@ -219,7 +411,7 @@ void MainWindow::buildUi() {
     workspaceDock->setTitleBarWidget(workspaceTitle);
     connect(newProject, &QToolButton::clicked, this, &MainWindow::addProject);
     m_workspaces = new WorkspaceProjectTree(workspaceDock, [this](const QString &id, int index) {
-        moveProject(id, index);
+        return moveProject(id, index);
     });
     m_workspaces->setObjectName("workspace-projects");
     m_workspaces->setColumnCount(3); m_workspaces->setHeaderHidden(true);
@@ -337,7 +529,10 @@ void MainWindow::buildUi() {
     auto *helpMenu = menuBar()->addMenu(tr("Help"));
     helpMenu->addAction(tr("About"), this, [this] {
         QMessageBox::about(this, tr("Better Agent Terminal — Qt"),
-            tr("Native Qt 6 interface with embedded KDE Konsole.\nAgent sessions use the existing Rust host.\nDevelopment branch: dev_qt"));
+            tr("Version %1\n\n"
+               "Native Qt 6 interface with embedded KDE Konsole.\n"
+               "Agent sessions use the existing Rust host.\nDevelopment branch: dev_qt")
+                .arg(QApplication::applicationVersion()));
     });
     report(tr("Starting Rust host…"));
 }
@@ -539,14 +734,14 @@ void MainWindow::rebuildWorkspaceTree() {
     }
 }
 
-void MainWindow::moveProject(const QString &id, int index) {
-    if (m_loading) return;
+bool MainWindow::moveProject(const QString &id, int index) {
+    if (m_loading) return false;
     auto qt = m_snapshot["qtUi"].toObject();
     auto projects = qt["projects"].toArray();
     for (int from = 0; from < projects.size(); ++from) {
         if (projects[from].toObject()["id"] != id) continue;
         const int to = index > from ? index - 1 : index;
-        if (to == from) return;
+        if (to == from) return false;
 
         const auto project = projects.takeAt(from);
         projects.insert(to, project);
@@ -554,8 +749,9 @@ void MainWindow::moveProject(const QString &id, int index) {
         m_snapshot["qtUi"] = qt;
         rebuildWorkspaceTree();
         scheduleSnapshotSave();
-        return;
+        return true;
     }
+    return false;
 }
 
 void MainWindow::addProject() {

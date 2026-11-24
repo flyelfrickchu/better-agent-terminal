@@ -14,6 +14,7 @@
 #include <QTabWidget>
 #include <QTreeWidget>
 #include <QHeaderView>
+#include <QDrag>
 #include <QListWidget>
 #include <QPlainTextEdit>
 #include <QSplitter>
@@ -50,6 +51,7 @@
 #include <QSaveFile>
 #include <QRegularExpression>
 #include <QVBoxLayout>
+#include <functional>
 
 class CoreTest : public QObject {
     Q_OBJECT
@@ -673,14 +675,18 @@ private slots:
         auto *tree = window.m_workspaces;
         auto *viewport = tree->viewport();
         const int x = tree->header()->sectionViewportPosition(1) + 48;
-        const auto drag = [&](QTreeWidgetItem *source, int destinationY) {
+        const auto drag = [&](QTreeWidgetItem *source, int destinationY,
+                              const std::function<void()> &beforeRelease = {}) {
             const QPoint from = viewport->mapToGlobal(QPoint(x, tree->visualItemRect(source).center().y()));
             const QPoint to = viewport->mapToGlobal(QPoint(x, destinationY));
             input.move(from);
             input.press(1);
             QTimer::singleShot(30, tree, [&input, from] { input.move(from + QPoint(20, 0)); });
             QTimer::singleShot(70, tree, [&input, to] { input.move(to); });
-            QTimer::singleShot(110, tree, [&] { input.release(1); });
+            QTimer::singleShot(110, tree, [&] {
+                if (beforeRelease) beforeRelease();
+                input.release(1);
+            });
             QTest::qWait(140);
         };
         const auto savedProjects = [&] { return window.m_snapshot["qtUi"].toObject()["projects"].toArray(); };
@@ -693,7 +699,40 @@ private slots:
         drag(tree->topLevelItem(0)->child(0), tree->visualItemRect(tree->topLevelItem(2)).bottom() - 1);
         QCOMPARE(savedProjects(), (QJsonArray{frontend, backend, empty}));
 
-        drag(tree->topLevelItem(2), tree->visualItemRect(tree->topLevelItem(0)).top() + 1);
+        // A drop below an expanded project belongs after its last workspace.
+        const auto frontendRow = tree->visualItemRect(tree->topLevelItem(0));
+        const int projectEnd = tree->visualItemRect(tree->topLevelItem(0)->child(1)).bottom() + 1;
+        auto palette = tree->palette();
+        const QColor guideColor(238, 63, 181);
+        palette.setColor(QPalette::Highlight, guideColor);
+        tree->setPalette(palette);
+        bool showedPreview = false;
+        QColor guidePixel;
+        QJsonArray projectsDuringDrag;
+        drag(tree->topLevelItem(2), frontendRow.bottom() - 1, [&] {
+            auto *preview = tree->findChild<QDrag *>();
+            showedPreview = preview && !preview->pixmap().isNull();
+            const auto image = viewport->grab().toImage();
+            guidePixel = image.pixelColor(QPoint(x, projectEnd) * image.devicePixelRatio());
+            projectsDuringDrag = savedProjects();
+        });
+        QVERIFY2(showedPreview, "The dragged project must have a visible cursor preview");
+        QCOMPARE(guidePixel, guideColor);
+        QCOMPARE(projectsDuringDrag, (QJsonArray{frontend, backend, empty}));
+        QCOMPARE(savedProjects(), (QJsonArray{frontend, empty, backend}));
+        auto *animation = viewport->findChild<QWidget *>("project-move-animation");
+        QVERIFY2(animation && animation->isVisible(), "Project rows must animate into position after the drop");
+        QTRY_VERIFY(!animation->isVisible());
+
+        const int aboveFrontend = tree->visualItemRect(tree->topLevelItem(0)).top() + 1;
+        drag(tree->topLevelItem(1), aboveFrontend, [&] {
+            input.keyEvent("Escape", true);
+            input.keyEvent("Escape", false);
+        });
+        QCOMPARE(savedProjects(), (QJsonArray{frontend, empty, backend}));
+        QVERIFY(!animation->isVisible());
+
+        drag(tree->topLevelItem(1), aboveFrontend);
         const auto snapshot = window.m_snapshot;
         window.applySnapshot(snapshot);
         QCOMPARE(savedProjects(), (QJsonArray{empty, frontend, backend}));
