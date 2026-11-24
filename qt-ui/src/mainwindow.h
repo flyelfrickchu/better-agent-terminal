@@ -38,6 +38,7 @@ private:
     void applySnapshot(const QJsonObject &snapshot, bool preserveLocalTabs = false);
     void normalizeProjects();
     void rebuildWorkspaceTree();
+    void moveProject(const QString &id, int index);
     QString defaultProjectName() const;
     void addProject();
     void renameProject();

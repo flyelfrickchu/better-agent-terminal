@@ -13,6 +13,7 @@
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
+#include <QHeaderView>
 #include <QListWidget>
 #include <QPlainTextEdit>
 #include <QSplitter>
@@ -647,6 +648,62 @@ private slots:
         window.applySnapshot(window.m_snapshot);
         QCOMPARE(tree->topLevelItemCount(), 3);
         QCOMPARE(tree->currentItem()->text(1), QString("UI"));
+    }
+    void projectMouseDragPersistsTopLevelOrder() {
+        if (QApplication::platformName() != "xcb")
+            QSKIP("Project drag requires native mouse input under X11");
+        X11Input input;
+        QVERIFY2(input.available(), "X11 and XTEST are required for native input");
+        QTemporaryDir directory;
+        MainWindow window(directory.path());
+        const QJsonObject frontend{{"id", "p1"}, {"name", "Frontend"},
+            {"workspaceIds", QJsonArray{"w1", "w2"}}, {"future", 42}};
+        const QJsonObject backend{{"id", "p2"}, {"name", "Backend"},
+            {"workspaceIds", QJsonArray{"w3"}}, {"collapsed", true}};
+        const QJsonObject empty{{"id", "p3"}, {"name", "Empty"}, {"workspaceIds", QJsonArray{}}};
+        const QJsonArray workspaces{
+            QJsonObject{{"id", "w1"}, {"name", "UI"}},
+            QJsonObject{{"id", "w2"}, {"name", "Docs"}},
+            QJsonObject{{"id", "w3"}, {"name", "API"}}};
+        window.applySnapshot({{"workspaces", workspaces}, {"qtUi", QJsonObject{
+            {"projects", QJsonArray{frontend, backend, empty}}, {"activeProjectId", "p1"},
+            {"activeWorkspaceId", "w1"}}}});
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto *tree = window.m_workspaces;
+        auto *viewport = tree->viewport();
+        const int x = tree->header()->sectionViewportPosition(1) + 48;
+        const auto drag = [&](QTreeWidgetItem *source, int destinationY) {
+            const QPoint from = viewport->mapToGlobal(QPoint(x, tree->visualItemRect(source).center().y()));
+            const QPoint to = viewport->mapToGlobal(QPoint(x, destinationY));
+            input.move(from);
+            input.press(1);
+            QTimer::singleShot(30, tree, [&input, from] { input.move(from + QPoint(20, 0)); });
+            QTimer::singleShot(70, tree, [&input, to] { input.move(to); });
+            QTimer::singleShot(110, tree, [&] { input.release(1); });
+            QTest::qWait(140);
+        };
+        const auto savedProjects = [&] { return window.m_snapshot["qtUi"].toObject()["projects"].toArray(); };
+        drag(tree->topLevelItem(0), tree->visualItemRect(tree->topLevelItem(2)).bottom() - 1);
+        QCOMPARE(savedProjects(), (QJsonArray{backend, empty, frontend}));
+        QCOMPARE(tree->topLevelItem(2)->text(1), QString("Frontend"));
+        QVERIFY(window.m_saveTimer.isActive());
+        drag(tree->topLevelItem(2), tree->visualItemRect(tree->topLevelItem(0)).top() + 1);
+        QCOMPARE(savedProjects(), (QJsonArray{frontend, backend, empty}));
+        drag(tree->topLevelItem(0)->child(0), tree->visualItemRect(tree->topLevelItem(2)).bottom() - 1);
+        QCOMPARE(savedProjects(), (QJsonArray{frontend, backend, empty}));
+
+        drag(tree->topLevelItem(2), tree->visualItemRect(tree->topLevelItem(0)).top() + 1);
+        const auto snapshot = window.m_snapshot;
+        window.applySnapshot(snapshot);
+        QCOMPARE(savedProjects(), (QJsonArray{empty, frontend, backend}));
+        QCOMPARE(snapshot["workspaces"].toArray(), workspaces);
+        QCOMPARE(tree->topLevelItem(0)->text(1), QString("Empty"));
+        QCOMPARE(tree->topLevelItem(1)->child(0)->text(1), QString("UI"));
+        QCOMPARE(tree->topLevelItem(1)->child(1)->text(1), QString("Docs"));
+        QVERIFY(tree->topLevelItem(1)->isExpanded());
+        QVERIFY(!tree->topLevelItem(2)->isExpanded());
+        QCOMPARE(window.m_workspaceId, QString("w1"));
     }
     void projectExpansionAndDefaultNames() {
         QTemporaryDir directory;

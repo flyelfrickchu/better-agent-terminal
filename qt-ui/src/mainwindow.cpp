@@ -14,6 +14,8 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDockWidget>
+#include <QDrag>
+#include <QDropEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -25,6 +27,7 @@
 #include <QListWidget>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QToolButton>
@@ -39,10 +42,54 @@
 #include <QTreeWidget>
 #include <QUuid>
 #include <QVBoxLayout>
+#include <functional>
 #include <utility>
 
 namespace {
 QString newId() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
+
+class WorkspaceProjectTree final : public QTreeWidget {
+public:
+    WorkspaceProjectTree(QWidget *parent, std::function<void(const QString &, int)> moveProject)
+        : QTreeWidget(parent), m_moveProject(std::move(moveProject)) {
+        setDragDropMode(InternalMove);
+        setDropIndicatorShown(true);
+    }
+
+protected:
+    void startDrag(Qt::DropActions) override {
+        auto *project = currentItem();
+        if (!project || project->parent() || topLevelItemCount() < 2) return;
+        auto *data = mimeData({project});
+        data->setData(projectIdFormat, project->data(0, Qt::UserRole).toString().toUtf8());
+        auto *drag = new QDrag(this);
+        drag->setMimeData(data);
+        drag->exec(Qt::MoveAction);
+    }
+
+    void dropEvent(QDropEvent *event) override {
+        const auto position = dropIndicatorPosition();
+        auto *target = itemAt(event->position().toPoint());
+        // Clear Qt's drag state without letting the tree model reparent items.
+        QDragLeaveEvent leave;
+        QTreeWidget::dragLeaveEvent(&leave);
+        event->ignore();
+        if (event->source() != this || !event->mimeData()->hasFormat(projectIdFormat)) return;
+
+        int index = topLevelItemCount();
+        if (target) {
+            if (target->parent() || (position != AboveItem && position != BelowItem)) return;
+            index = indexOfTopLevelItem(target) + (position == BelowItem ? 1 : 0);
+        }
+        m_moveProject(QString::fromUtf8(event->mimeData()->data(projectIdFormat)), index);
+        event->setDropAction(Qt::MoveAction);
+        event->accept();
+    }
+
+private:
+    static constexpr auto projectIdFormat = "application/x-bat-project-id";
+    std::function<void(const QString &, int)> m_moveProject;
+};
 }
 
 MainWindow::MainWindow(const QString &dataDirectory, QWidget *parent)
@@ -171,7 +218,9 @@ void MainWindow::buildUi() {
     connect(closeWorkspaces, &QToolButton::clicked, workspaceDock, &QDockWidget::close);
     workspaceDock->setTitleBarWidget(workspaceTitle);
     connect(newProject, &QToolButton::clicked, this, &MainWindow::addProject);
-    m_workspaces = new QTreeWidget(workspaceDock);
+    m_workspaces = new WorkspaceProjectTree(workspaceDock, [this](const QString &id, int index) {
+        moveProject(id, index);
+    });
     m_workspaces->setObjectName("workspace-projects");
     m_workspaces->setColumnCount(3); m_workspaces->setHeaderHidden(true);
     m_workspaces->setRootIsDecorated(false);
@@ -457,6 +506,7 @@ void MainWindow::rebuildWorkspaceTree() {
     for (const auto &entry : projects) {
         const auto project = entry.toObject(); const QString id = project["id"].toString();
         auto *group = new QTreeWidgetItem(m_workspaces);
+        group->setFlags(group->flags() & ~Qt::ItemIsDropEnabled);
         group->setData(0, Qt::UserRole, id); group->setText(1, project["name"].toString());
         group->setIcon(1, QIcon::fromTheme("folder"));
         auto font = group->font(1); font.setBold(true); group->setFont(1, font);
@@ -478,6 +528,7 @@ void MainWindow::rebuildWorkspaceTree() {
         for (const auto &member : project["workspaceIds"].toArray()) {
             const QString workspaceId = member.toString(); const auto workspace = workspaces.value(workspaceId);
             auto *item = new QTreeWidgetItem(group);
+            item->setFlags(item->flags() & ~(Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled));
             item->setText(1, workspace["alias"].toString(workspace["name"].toString()));
             item->setData(0, Qt::UserRole, workspaceId);
             item->setToolTip(1, workspace["folderPath"].toString());
@@ -485,6 +536,25 @@ void MainWindow::rebuildWorkspaceTree() {
             if (id == m_projectId && workspaceId == m_workspaceId) m_workspaces->setCurrentItem(item);
         }
         group->setExpanded(expanded);
+    }
+}
+
+void MainWindow::moveProject(const QString &id, int index) {
+    if (m_loading) return;
+    auto qt = m_snapshot["qtUi"].toObject();
+    auto projects = qt["projects"].toArray();
+    for (int from = 0; from < projects.size(); ++from) {
+        if (projects[from].toObject()["id"] != id) continue;
+        const int to = index > from ? index - 1 : index;
+        if (to == from) return;
+
+        const auto project = projects.takeAt(from);
+        projects.insert(to, project);
+        qt["projects"] = projects;
+        m_snapshot["qtUi"] = qt;
+        rebuildWorkspaceTree();
+        scheduleSnapshotSave();
+        return;
     }
 }
 
