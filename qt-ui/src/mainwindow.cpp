@@ -28,6 +28,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -113,6 +114,8 @@ private:
 
 class WorkspaceProjectTree final : public QTreeWidget {
 public:
+    static constexpr int dragHandleColumn = 3;
+
     WorkspaceProjectTree(QWidget *parent, std::function<bool(const QString &, int)> moveProject)
         : QTreeWidget(parent), m_moveProject(std::move(moveProject)),
           m_animation(new ProjectMoveAnimation(viewport())) {
@@ -127,20 +130,19 @@ protected:
         QTreeWidget::reset();
     }
 
-    void startDrag(Qt::DropActions) override {
-        auto *project = currentItem();
-        if (!project || project->parent() || topLevelItemCount() < 2) return;
-        m_animation->clear();
-        m_draggedProject = indexFromItem(project);
-        auto *data = mimeData({project});
-        data->setData(projectIdFormat, project->data(0, Qt::UserRole).toString().toUtf8());
-        auto *drag = new QDrag(this);
-        drag->setMimeData(data);
-        drag->setPixmap(projectPreview(project));
-        drag->setHotSpot(QPoint(-12, -8));
-        drag->exec(Qt::MoveAction);
-        m_draggedProject = QPersistentModelIndex();
-        setDragPosition(std::nullopt);
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto *handle = qobject_cast<QToolButton *>(watched);
+            const auto *mouse = static_cast<QMouseEvent *>(event);
+            if (handle && handle->isEnabled() && mouse->button() == Qt::LeftButton) {
+                auto *project = itemAt(handle->mapTo(viewport(), mouse->position().toPoint()));
+                if (project && itemWidget(project, dragHandleColumn) == handle) {
+                    dragProject(project);
+                    return true;
+                }
+            }
+        }
+        return QTreeWidget::eventFilter(watched, event);
     }
 
     void dragMoveEvent(QDragMoveEvent *event) override {
@@ -212,6 +214,20 @@ protected:
 
 private:
     struct DropLocation { int index = -1; int y = -1; };
+
+    void dragProject(QTreeWidgetItem *project) {
+        m_animation->clear();
+        m_draggedProject = indexFromItem(project);
+        auto *data = mimeData({project});
+        data->setData(projectIdFormat, project->data(0, Qt::UserRole).toString().toUtf8());
+        auto *drag = new QDrag(this);
+        drag->setMimeData(data);
+        drag->setPixmap(projectPreview(project));
+        drag->setHotSpot(QPoint(-12, -8));
+        drag->exec(Qt::MoveAction);
+        m_draggedProject = QPersistentModelIndex();
+        setDragPosition(std::nullopt);
+    }
 
     bool isProjectDrag(const QDropEvent *event) const {
         return m_draggedProject.isValid() && event->source() == this &&
@@ -414,12 +430,15 @@ void MainWindow::buildUi() {
         return moveProject(id, index);
     });
     m_workspaces->setObjectName("workspace-projects");
-    m_workspaces->setColumnCount(3); m_workspaces->setHeaderHidden(true);
+    constexpr int dragHandleColumn = WorkspaceProjectTree::dragHandleColumn;
+    m_workspaces->setColumnCount(dragHandleColumn + 1); m_workspaces->setHeaderHidden(true);
     m_workspaces->setRootIsDecorated(false);
     m_workspaces->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_workspaces->header()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_workspaces->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_workspaces->header()->setSectionResizeMode(dragHandleColumn, QHeaderView::ResizeToContents);
     m_workspaces->header()->setStretchLastSection(false);
+    m_workspaces->header()->moveSection(dragHandleColumn, 0);
     m_workspaces->setTreePosition(1);
     m_workspaces->setContextMenuPolicy(Qt::CustomContextMenu);
     workspaceDock->setWidget(m_workspaces); addDockWidget(Qt::LeftDockWidgetArea, workspaceDock);
@@ -701,10 +720,21 @@ void MainWindow::rebuildWorkspaceTree() {
     for (const auto &entry : projects) {
         const auto project = entry.toObject(); const QString id = project["id"].toString();
         auto *group = new QTreeWidgetItem(m_workspaces);
-        group->setFlags(group->flags() & ~Qt::ItemIsDropEnabled);
+        group->setFlags(group->flags() & ~(Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled));
         group->setData(0, Qt::UserRole, id); group->setText(1, project["name"].toString());
         group->setIcon(1, QIcon::fromTheme("folder"));
         auto font = group->font(1); font.setBold(true); group->setFont(1, font);
+        auto *handle = new QToolButton(m_workspaces);
+        handle->setText(QStringLiteral("＝"));
+        handle->setToolTip(tr("Drag to reorder project"));
+        handle->setAccessibleName(tr("Reorder %1").arg(project["name"].toString()));
+        handle->setAutoRaise(true);
+        handle->setMinimumWidth(24);
+        handle->setFocusPolicy(Qt::NoFocus);
+        handle->setEnabled(projects.size() > 1);
+        if (handle->isEnabled()) handle->setCursor(Qt::OpenHandCursor);
+        handle->installEventFilter(m_workspaces);
+        m_workspaces->setItemWidget(group, WorkspaceProjectTree::dragHandleColumn, handle);
         const bool expanded = !project["collapsed"].toBool();
         auto *toggle = new QToolButton(m_workspaces);
         toggle->setText(expanded ? "−" : "+");
